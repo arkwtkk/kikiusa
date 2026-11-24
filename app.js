@@ -1,0 +1,893 @@
+// app.js — ききウサ（iPad 用オーディオブックプレーヤー）
+import { AUDIO_EXT, IMAGE_EXT, extOf, baseName, mimeOf, parseAudioMeta } from './parse.js';
+import * as db from './db.js';
+
+const VERSION = '0.1';
+const $ = (id) => document.getElementById(id);
+const audio = $('audio');
+const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const SLEEPS = [5, 15, 30, 45, 60];
+const SKIP_BACK = 15, SKIP_FWD = 30;
+const COLORS = ['#2E4A7D', '#2F6B4F', '#8A3B45', '#3B3B3B', '#5B4A8A', '#7A5634'];
+
+let books = [];
+const coverUrls = new Map();     // coverId -> object URL
+const P = {                       // 再生中の状態
+  book: null, fi: 0, url: null, pendingSeek: null, chapterIdx: -1,
+  lastSave: 0, pausedAt: 0, next: null, loadToken: 0, seekTries: 0, playAfterSeek: false,
+};
+let rate = Number(localStorage.getItem('kk.rate')) || 1;
+let sleep = { mode: 'off', until: 0 };   // off | time | chapter
+let seeking = false;
+
+// ---------------- 小物 ----------------
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+function byName(a, b) { return a.name.localeCompare(b.name, 'ja', { numeric: true, sensitivity: 'base' }); }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function hashColor(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.codePointAt(0)) >>> 0; return COLORS[h % COLORS.length]; }
+
+function clock(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+function jaDur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  if (h && m === 60) return `${h + 1}時間`;
+  if (h) return m ? `${h}時間${m}分` : `${h}時間`;
+  return m ? `${m}分` : `${sec}秒`;
+}
+function size(bytes) {
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + 'GB';
+  if (bytes >= 1e6) return Math.round(bytes / 1e6) + 'MB';
+  return Math.max(1, Math.round(bytes / 1e3)) + 'KB';
+}
+
+let toastTimer = 0;
+function toast(msg, ms = 3200) {
+  const t = $('toast');
+  t.textContent = msg; t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
+}
+function showBusy(text, ratio) {
+  $('busy').hidden = false; $('busyText').textContent = text;
+  const bar = $('busyBar');
+  if (ratio == null) bar.removeAttribute('value'); else bar.value = ratio;
+}
+function hideBusy() { $('busy').hidden = true; }
+
+function openSheet(build) {
+  const body = $('sheetBody');
+  body.replaceChildren();
+  build(body);
+  $('sheet').hidden = false;
+}
+function closeSheet() { $('sheet').hidden = true; $('sheetBody').replaceChildren(); }
+$('sheet').addEventListener('click', (e) => { if (e.target === $('sheet')) closeSheet(); });
+
+function actions(parent, list) {
+  const row = el('div', 'sheet-actions');
+  for (const [label, cls, fn] of list) {
+    const b = el('button', cls, label);
+    b.onclick = fn;
+    row.append(b);
+  }
+  parent.append(row);
+  return row;
+}
+
+// ---------------- 進み具合（localStorage：すぐ書ける） ----------------
+
+function getProg(id) {
+  try { return JSON.parse(localStorage.getItem('kk.p.' + id)) || null; } catch { return null; }
+}
+function setProg(id, f, t) {
+  try { localStorage.setItem('kk.p.' + id, JSON.stringify({ f, t: Math.round(Math.max(0, t) * 10) / 10, at: Date.now() })); } catch { }
+}
+function fileOffset(book, fi) {
+  let s = 0;
+  for (let i = 0; i < fi && i < book.files.length; i++) s += book.files[i].duration || 0;
+  return s;
+}
+function bookPos(book) {
+  if (P.book === book && P.pendingSeek == null) return fileOffset(book, P.fi) + (audio.currentTime || 0);
+  if (P.book === book && P.pendingSeek != null) return fileOffset(book, P.fi) + P.pendingSeek;
+  const p = getProg(book.id);
+  return p ? fileOffset(book, p.f) + p.t : 0;
+}
+function lastActivity(b) { const p = getProg(b.id); return Math.max(p ? p.at : 0, b.addedAt || 0); }
+
+// ---------------- 表紙 ----------------
+
+async function coverUrl(book) {
+  if (!book.coverId) return null;
+  if (coverUrls.has(book.coverId)) return coverUrls.get(book.coverId);
+  const blob = await db.getBlob(book.coverId).catch(() => null);
+  if (!blob) return null;
+  const url = URL.createObjectURL(blob);
+  coverUrls.set(book.coverId, url);
+  return url;
+}
+function fillCover(box, book) {
+  box.replaceChildren();
+  box.style.background = hashColor(book.title);
+  box.append(el('div', 'ph', book.title));
+  coverUrl(book).then(url => {
+    if (!url) return;
+    const img = new Image();
+    img.alt = '';
+    img.onload = () => { box.replaceChildren(img); box.style.background = 'transparent'; };
+    img.src = url;
+  });
+}
+
+// ---------------- 本棚 ----------------
+
+async function refreshLibrary() {
+  books = await db.allBooks();
+  books.sort((a, b) => lastActivity(b) - lastActivity(a));
+  renderLibrary();
+}
+
+function renderLibrary() {
+  const grid = $('books');
+  grid.replaceChildren();
+  $('empty').hidden = books.length > 0;
+  for (const b of books) {
+    const card = el('div', 'card' + (P.book && P.book.id === b.id ? ' now' : ''));
+    const cov = el('div', 'cover');
+    fillCover(cov, b);
+    const pos = bookPos(b);
+    const dur = b.duration || 0;
+    const pct = b.finished ? 100 : dur ? Math.min(100, pos / dur * 100) : 0;
+    let meta;
+    if (b.finished) meta = '聞き終わり';
+    else if (pos < 5) meta = `未再生・${jaDur(dur)}`;
+    else meta = `残り ${jaDur(Math.max(0, dur - pos))}`;
+    const bar = el('div', 'card-bar'); const fill = el('i'); fill.style.width = pct + '%'; bar.append(fill);
+    const more = el('button', 'card-more', '…');
+    more.setAttribute('aria-label', '本のメニュー');
+    more.onclick = (e) => { e.stopPropagation(); bookMenu(b); };
+    card.append(cov, el('div', 'card-title', b.title), el('div', 'card-meta', meta), bar, more);
+    card.onclick = () => openBook(b);
+    grid.append(card);
+  }
+  renderMini();
+  renderStorage();
+}
+
+async function renderStorage() {
+  const used = books.reduce((s, b) => s + b.files.reduce((t, f) => t + (f.size || 0), 0), 0);
+  let text = `${books.length}冊・${size(used)}`;
+  try {
+    const est = await navigator.storage?.estimate?.();
+    if (est && est.quota) text += `（空きの目安 ${size(Math.max(0, est.quota - est.usage))}）`;
+  } catch { }
+  $('storage').textContent = text;
+  $('version').textContent = 'ききウサ v' + VERSION;
+}
+
+function bookMenu(b) {
+  openSheet(body => {
+    body.append(el('h2', null, b.title));
+    const info = el('p', 'muted', `${b.chapters.length}章・${jaDur(b.duration)}・${size(b.files.reduce((s, f) => s + (f.size || 0), 0))}`);
+    const opts = el('div', 'opts');
+    const add = (label, fn, cls) => { const x = el('button', cls, label); x.onclick = fn; opts.append(x); };
+    add('名前を変える', () => renameBook(b));
+    add('最初から聞く', async () => {
+      closeSheet();
+      b.finished = false; await db.putBook(b);
+      setProg(b.id, 0, 0);
+      if (P.book && P.book.id === b.id) { await loadFile(0, 0, false); renderPlayer(); }
+      renderLibrary();
+    });
+    add(b.finished ? '「聞き終わり」を外す' : '聞き終わりにする', async () => {
+      closeSheet(); b.finished = !b.finished; await db.putBook(b); renderLibrary();
+    });
+    add('削除する', () => confirmDelete(b), 'danger');
+    body.append(info, opts);
+    actions(body, [['閉じる', 'cancel', closeSheet]]);
+  });
+}
+
+function renameBook(b) {
+  openSheet(body => {
+    body.append(el('h2', null, '名前を変える'));
+    const input = el('input', 'field'); input.type = 'text'; input.value = b.title;
+    body.append(input);
+    actions(body, [
+      ['やめる', 'cancel', closeSheet],
+      ['保存', 'go', async () => {
+        const v = input.value.trim(); if (!v) return;
+        b.title = v; await db.putBook(b); closeSheet();
+        renderLibrary(); if (P.book === b) { renderPlayer(); updateMediaMetadata(); }
+      }],
+    ]);
+    setTimeout(() => input.focus(), 50);
+  });
+}
+
+function confirmDelete(b) {
+  openSheet(body => {
+    body.append(el('h2', null, '本を削除しますか？'));
+    body.append(el('p', null, `「${b.title}」を本棚から消し、iPad の中の音声も消します。OneDrive のファイルは消えません。`));
+    actions(body, [
+      ['やめる', 'cancel', closeSheet],
+      ['削除する', 'go danger', async () => {
+        closeSheet();
+        if (P.book && P.book.id === b.id) unloadBook();
+        await db.deleteBook(b);
+        try { localStorage.removeItem('kk.p.' + b.id); } catch { }
+        if (b.coverId && coverUrls.has(b.coverId)) { URL.revokeObjectURL(coverUrls.get(b.coverId)); coverUrls.delete(b.coverId); }
+        await refreshLibrary();
+        toast('削除しました');
+      }],
+    ]);
+  });
+}
+
+// ---------------- 取り込み ----------------
+
+$('btnImport').onclick = () => { const i = $('fileInput'); i.value = ''; i.click(); };
+$('fileInput').onchange = (e) => { const files = [...e.target.files]; if (files.length) planImport(files); };
+
+function stripNum(s) { return s.replace(/^\s*\d+\s*[_\-.\s]\s*/, '').trim() || s; }
+function sameFiles(book, files) {
+  if (book.files.length !== files.length) return false;
+  const a = book.files.map(f => f.name + '/' + f.size).sort().join('|');
+  const b = files.map(f => f.name + '/' + f.size).sort().join('|');
+  return a === b;
+}
+function commonPrefix(names) {
+  if (!names.length) return '';
+  let p = names[0];
+  for (const n of names) { while (!n.startsWith(p)) p = p.slice(0, -1); }
+  return p.replace(/[\s_\-.(（\d]+$/, '').trim();
+}
+function groupTitle(files, metas) {
+  const albums = files.map(f => metas.get(f).album).filter(Boolean);
+  if (albums.length === files.length && albums.every(a => a === albums[0])) return albums[0];
+  if (files.length === 1) return metas.get(files[0]).title || baseName(files[0].name);
+  const pre = commonPrefix(files.map(f => baseName(f.name)));
+  if (pre.length >= 2) return pre;
+  return albums[0] || baseName(files[0].name);
+}
+
+async function planImport(files) {
+  const audios = files.filter(f => AUDIO_EXT.includes(extOf(f.name)));
+  const images = files.filter(f => IMAGE_EXT.includes(extOf(f.name)));
+  if (!audios.length) { toast('音声ファイル（.m4b・.mp3 など）が選ばれていません'); return; }
+  showBusy('ファイルを調べています…');
+  const metas = new Map();
+  for (const f of audios) metas.set(f, await parseAudioMeta(f, f.name).catch(() => ({})));
+  hideBusy();
+
+  const plans = [];
+  for (const f of audios.filter(f => extOf(f.name) === 'm4b')) {
+    const m = metas.get(f);
+    plans.push({ files: [f], title: m.title || m.album || baseName(f.name), author: m.artist || '' });
+  }
+  const rest = audios.filter(f => extOf(f.name) !== 'm4b').sort(byName);
+  if (rest.length) {
+    const artists = rest.map(f => metas.get(f).artist).filter(Boolean);
+    plans.push({ files: rest, title: groupTitle(rest, metas), author: artists[0] || '' });
+  }
+  for (const p of plans) {
+    p.coverFile = images.find(im => baseName(im.name) === baseName(p.files[0].name))
+      || images.find(im => /^(cover|folder|front)$/i.test(baseName(im.name)))
+      || (images.length === 1 ? images[0] : null);
+    p.embedded = p.files.map(f => metas.get(f).cover).find(Boolean) || null;
+    p.chapterCount = p.files.reduce((s, f) => s + Math.max(1, (metas.get(f).chapters || []).length), 0);
+    p.duration = p.files.reduce((s, f) => s + (metas.get(f).duration || 0), 0);
+    p.bytes = p.files.reduce((s, f) => s + f.size, 0);
+    p.dup = books.some(b => sameFiles(b, p.files));
+    p.include = !p.dup;
+  }
+  showImportSheet(plans, metas);
+}
+
+function showImportSheet(plans, metas) {
+  openSheet(body => {
+    body.append(el('h2', null, plans.length > 1 ? `${plans.length}冊を取り込みます` : '本を取り込みます'));
+    for (const p of plans) {
+      const row = el('div', 'plan');
+      const cb = el('input'); cb.type = 'checkbox'; cb.checked = p.include;
+      cb.onchange = () => { p.include = cb.checked; };
+      const main = el('div', 'plan-main');
+      const name = el('input'); name.type = 'text'; name.value = p.title;
+      name.oninput = () => { p.title = name.value; };
+      const parts = [p.files.length > 1 ? `${p.files.length}ファイル` : extOf(p.files[0].name).toUpperCase(), `${p.chapterCount}章`];
+      if (p.duration) parts.push(jaDur(p.duration));
+      parts.push(size(p.bytes));
+      parts.push(p.coverFile || p.embedded ? '表紙あり' : '表紙なし');
+      main.append(name, el('div', 'plan-meta', parts.join('・')));
+      if (p.dup) main.append(el('div', 'plan-warn', '同じ本がもう本棚にあります（取り込むと2冊になります）'));
+      row.append(cb, main);
+      body.append(row);
+    }
+    actions(body, [
+      ['やめる', 'cancel', closeSheet],
+      ['取り込む', 'go', () => {
+        const chosen = plans.filter(p => p.include && p.title.trim());
+        closeSheet();
+        if (chosen.length) doImport(chosen, metas);
+      }],
+    ]);
+  });
+}
+
+function measureDuration(blob) {
+  return new Promise(resolve => {
+    const a = new Audio();
+    const url = URL.createObjectURL(blob);
+    let done = false;
+    const fin = (d) => {
+      if (done) return; done = true;
+      URL.revokeObjectURL(url); a.removeAttribute('src'); try { a.load(); } catch { }
+      resolve(d);
+    };
+    a.preload = 'metadata';
+    a.onloadedmetadata = () => fin(isFinite(a.duration) ? a.duration : 0);
+    a.onerror = () => fin(0);
+    setTimeout(() => fin(0), 4000);
+    a.src = url;
+  });
+}
+
+function buildChapters(files, metas) {
+  const ch = [];
+  files.forEach((f, i) => {
+    const m = metas[i] || {};
+    const dur = f.duration || 0;
+    const list = (m.chapters || []).filter(c => !dur || c.start < dur - 0.5);
+    if (list.length) {
+      if (list[0].start > 1) list.unshift({ start: 0, title: m.title || stripNum(baseName(f.name)) });
+      list.forEach((c, j) => ch.push({
+        title: c.title || `第${j + 1}章`, file: i, start: c.start,
+        end: j + 1 < list.length ? list[j + 1].start : dur,
+      }));
+    } else {
+      ch.push({ title: m.title || stripNum(baseName(f.name)), file: i, start: 0, end: dur });
+    }
+  });
+  return ch;
+}
+
+async function doImport(plans, metas) {
+  try { await navigator.storage?.persist?.(); } catch { }
+  let made = 0;
+  for (const [pi, p] of plans.entries()) {
+    const id = uid();
+    const saved = [];
+    try {
+      const files = [];
+      for (const [j, f] of p.files.entries()) {
+        showBusy(`取り込み中 ${pi + 1}/${plans.length}：${p.title}（${j + 1}/${p.files.length}）`, (j) / p.files.length);
+        const m = metas.get(f) || {};
+        const blob = new Blob([f], { type: mimeOf(f.name) });
+        const blobId = `${id}.${j}`;
+        await db.putBlob(blobId, blob);
+        saved.push(blobId);
+        let dur = m.duration || 0;
+        if (!dur) dur = await measureDuration(blob);
+        files.push({ blobId, name: f.name, size: f.size, type: blob.type, duration: dur });
+      }
+      let coverId = null;
+      const coverBlob = p.coverFile ? new Blob([p.coverFile], { type: mimeOf(p.coverFile.name) }) : p.embedded;
+      if (coverBlob) { coverId = `${id}.cover`; await db.putBlob(coverId, coverBlob); saved.push(coverId); }
+      const book = {
+        id, title: p.title.trim(), author: p.author || '', addedAt: Date.now(), finished: false,
+        files, coverId,
+        chapters: buildChapters(files, p.files.map(f => metas.get(f))),
+        duration: files.reduce((s, f) => s + (f.duration || 0), 0),
+      };
+      await db.putBook(book);
+      made++;
+    } catch (e) {
+      await db.deleteBlobs(saved).catch(() => { });
+      hideBusy();
+      const msg = db.isQuotaError(e) ? 'iPad の空き容量が足りません。いらない本を削除してから取り込んでください。'
+        : `取り込めませんでした：${e && e.message || e}`;
+      openSheet(body => { body.append(el('h2', null, p.title), el('p', null, msg)); actions(body, [['閉じる', 'go', closeSheet]]); });
+      break;
+    }
+  }
+  hideBusy();
+  await refreshLibrary();
+  if (made) toast(made > 1 ? `${made}冊を取り込みました` : '取り込みました');
+}
+
+// ---------------- 再生 ----------------
+
+function chapterIndexAt(fi, t) {
+  const ch = P.book ? P.book.chapters : [];
+  let idx = -1;
+  for (let i = 0; i < ch.length; i++) {
+    if (ch[i].file < fi || (ch[i].file === fi && ch[i].start <= t + 0.05)) idx = i;
+    else break;
+  }
+  return Math.max(0, idx);
+}
+function chapterEnd(ch) {
+  if (ch.end) return ch.end;
+  const f = P.book.files[ch.file];
+  if (ch.file === P.fi && isFinite(audio.duration) && audio.duration > 0) return audio.duration;
+  return f.duration || ch.start;
+}
+function curTime() { return P.pendingSeek != null ? P.pendingSeek : (audio.currentTime || 0); }
+
+async function openBook(book) {
+  showView('player');
+  if (P.book && P.book.id === book.id) { renderPlayer(); return; }
+  if (P.book) { saveNow(); audio.pause(); }
+  P.book = book; P.chapterIdx = -1;
+  clearNext();
+  let fi = 0, t = 0;
+  const pr = getProg(book.id);
+  if (pr && !book.finished) { fi = Math.min(Math.max(0, pr.f | 0), book.files.length - 1); t = pr.t || 0; }
+  P.fi = fi; P.pendingSeek = t;
+  renderPlayer();
+  await loadFile(fi, t, false);
+}
+
+function unloadBook() {
+  audio.pause();
+  audio.removeAttribute('src'); try { audio.load(); } catch { }
+  if (P.url) URL.revokeObjectURL(P.url);
+  clearNext();
+  Object.assign(P, { book: null, fi: 0, url: null, pendingSeek: null, chapterIdx: -1 });
+  clearSleep();
+  if ('mediaSession' in navigator) navigator.mediaSession.metadata = null;
+  showView('library');
+}
+
+function clearNext() {
+  if (P.next && P.next.url) URL.revokeObjectURL(P.next.url);
+  P.next = null;
+}
+
+// 次のファイルを先に用意しておく（画面ロック中に IndexedDB を待たずに次へ進めるように）
+async function prepareNext() {
+  const b = P.book; if (!b) return;
+  const fi = P.fi + 1;
+  if (fi >= b.files.length || (P.next && P.next.fi === fi)) return;
+  clearNext();
+  const blob = await db.getBlob(b.files[fi].blobId).catch(() => null);
+  if (!blob || P.book !== b || P.fi + 1 !== fi) return;
+  P.next = { fi, url: URL.createObjectURL(blob) };
+}
+
+async function loadFile(fi, t, autoplay) {
+  const b = P.book; if (!b) return;
+  const token = ++P.loadToken;
+  let url;
+  if (P.next && P.next.fi === fi) { url = P.next.url; P.next = null; }
+  else {
+    const blob = await db.getBlob(b.files[fi].blobId).catch(() => null);
+    if (P.book !== b || token !== P.loadToken) return;
+    if (!blob) { toast('音声が見つかりません。本を取り込み直してください。'); return; }
+    url = URL.createObjectURL(blob);
+  }
+  if (P.url) URL.revokeObjectURL(P.url);
+  clearNext();
+  P.url = url; P.fi = fi;
+  P.pendingSeek = t > 0.3 ? t : null;
+  P.seekTries = 0;
+  P.playAfterSeek = !!autoplay && P.pendingSeek != null;   // 位置を合わせてから鳴らす
+  P.chapterIdx = chapterIndexAt(fi, t);
+  audio.src = url;
+  audio.defaultPlaybackRate = rate; audio.playbackRate = rate;
+  updateMediaMetadata();
+  renderPlayer();
+  if (autoplay && !P.playAfterSeek) doPlay();
+}
+
+function applyPendingSeek() {
+  if (P.pendingSeek == null || audio.readyState < 1) return;
+  let t = P.pendingSeek;
+  if (isFinite(audio.duration) && audio.duration > 0) t = Math.min(t, Math.max(0, audio.duration - 1));
+  if (Math.abs(audio.currentTime - t) < 0.5) {
+    P.pendingSeek = null; P.seekTries = 0;
+    if (P.playAfterSeek) { P.playAfterSeek = false; doPlay(); }
+    return;
+  }
+  if (++P.seekTries > 30) {          // どうしても動かないときはあきらめて今の位置から
+    P.pendingSeek = null; P.seekTries = 0;
+    if (P.playAfterSeek) { P.playAfterSeek = false; doPlay(); }
+    return;
+  }
+  try { audio.currentTime = t; } catch { }
+}
+
+function doPlay() {
+  if (!P.book) return;
+  if (!audio.src) { toast('準備中です。もう一度押してください'); return; }
+  if (P.book.finished) { P.book.finished = false; db.putBook(P.book); }
+  if (P.pausedAt && Date.now() - P.pausedAt > 60000 && P.pendingSeek == null && audio.currentTime > 3) {
+    audio.currentTime = Math.max(0, audio.currentTime - 3);   // しばらく止めていたら3秒もどる
+  }
+  audio.playbackRate = rate;
+  if (P.pendingSeek != null && audio.readyState >= 1) applyPendingSeek();
+  const pr = audio.play();
+  if (pr) pr.catch(err => {
+    if (err && err.name === 'AbortError') return;
+    toast(err && err.name === 'NotAllowedError' ? 'もう一度 ▶ を押してください' : `再生できませんでした：${err && err.message || err}`);
+  });
+}
+function togglePlay() { if (audio.paused) doPlay(); else audio.pause(); }
+
+function saveNow() {
+  if (!P.book || !audio.src) return;
+  setProg(P.book.id, P.fi, curTime());
+  P.lastSave = Date.now();
+}
+
+async function seekBook(fi, t, keepPlaying = !audio.paused) {
+  const b = P.book; if (!b) return;
+  fi = Math.max(0, Math.min(fi, b.files.length - 1));
+  P.chapterIdx = chapterIndexAt(fi, t);
+  if (fi === P.fi && audio.src) {
+    if (P.pendingSeek != null) P.pendingSeek = t;
+    else { try { audio.currentTime = Math.max(0, t); } catch { P.pendingSeek = t; } }
+    saveNow(); renderPlayer(); updateMediaMetadata(); updatePositionState();
+  } else {
+    await loadFile(fi, t, keepPlaying);
+    saveNow();
+  }
+}
+
+function skip(sec) {
+  const b = P.book; if (!b) return;
+  let fi = P.fi, t = curTime() + sec;
+  const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (b.files[fi].duration || 0);
+  if (t > dur - 0.3) {
+    if (fi + 1 < b.files.length) { t = Math.min(t - dur, (b.files[fi + 1].duration || 1) - 1); fi++; }
+    else t = Math.max(0, dur - 0.5);
+  } else if (t < 0) {
+    if (fi > 0) { fi--; t = Math.max(0, (b.files[fi].duration || 0) + t); }
+    else t = 0;
+  }
+  seekBook(fi, Math.max(0, t));
+}
+
+function gotoChapter(i) {
+  const ch = P.book.chapters[i]; if (!ch) return;
+  seekBook(ch.file, ch.start);
+}
+function prevChapter() {
+  const i = chapterIndexAt(P.fi, curTime());
+  const ch = P.book.chapters[i];
+  if (curTime() - ch.start > 3 || i === 0) gotoChapter(i); else gotoChapter(i - 1);
+}
+function nextChapter() {
+  const i = chapterIndexAt(P.fi, curTime());
+  if (i + 1 < P.book.chapters.length) gotoChapter(i + 1);
+  else toast('最後の章です');
+}
+
+// 音声の出来事
+['loadedmetadata', 'canplay', 'playing', 'seeked', 'timeupdate'].forEach(ev => audio.addEventListener(ev, applyPendingSeek));
+audio.addEventListener('loadedmetadata', () => {
+  audio.playbackRate = rate;
+  fixDuration();
+  updatePositionState();
+  renderPlayer();
+});
+audio.addEventListener('play', () => { renderPlayState(); updatePositionState(); });
+audio.addEventListener('playing', () => { prepareNext(); renderPlayState(); });
+audio.addEventListener('pause', () => { P.pausedAt = Date.now(); saveNow(); renderPlayState(); updatePositionState(); });
+audio.addEventListener('ratechange', updatePositionState);
+audio.addEventListener('seeked', updatePositionState);
+audio.addEventListener('timeupdate', onTime);
+audio.addEventListener('ended', onEnded);
+audio.addEventListener('error', () => {
+  if (!audio.src || !P.book) return;
+  toast('この音声は再生できませんでした（形式に対応していない可能性があります）');
+});
+
+// 実際の長さが取り込み時の見積もりと違ったら直す
+function fixDuration() {
+  const b = P.book; if (!b) return;
+  const d = audio.duration;
+  if (!isFinite(d) || d <= 0) return;
+  const f = b.files[P.fi];
+  if (Math.abs((f.duration || 0) - d) < 1) return;
+  const old = f.duration || 0;
+  f.duration = d;
+  for (const ch of b.chapters) if (ch.file === P.fi && (!ch.end || Math.abs(ch.end - old) < 1)) ch.end = d;
+  b.duration = b.files.reduce((s, x) => s + (x.duration || 0), 0);
+  db.putBook(b).catch(() => { });
+}
+
+function onTime() {
+  if (!P.book) return;
+  const t = curTime();
+  const idx = chapterIndexAt(P.fi, t);
+  if (idx !== P.chapterIdx) {
+    const prev = P.chapterIdx;
+    P.chapterIdx = idx;
+    if (sleep.mode === 'chapter' && idx === prev + 1 && !audio.paused) {
+      audio.pause();
+      const ch = P.book.chapters[idx];
+      if (ch.file === P.fi) { try { audio.currentTime = ch.start; } catch { } }
+      clearSleep();
+      toast('スリープ：章の終わりで止めました');
+    }
+    updateMediaMetadata();
+  }
+  if (sleep.mode === 'time' && Date.now() >= sleep.until && !audio.paused) {
+    audio.pause(); clearSleep(); toast('スリープ：止めました');
+  }
+  if (P.pendingSeek == null && Date.now() - P.lastSave > 5000) saveNow();
+  if (!$('player').hidden && !seeking) renderTimes();
+  if (Date.now() - (onTime.ps || 0) > 4000) { onTime.ps = Date.now(); updatePositionState(); }
+}
+
+function onEnded() {
+  const b = P.book; if (!b) return;
+  if (P.fi + 1 < b.files.length) {
+    if (sleep.mode === 'chapter') {
+      clearSleep();
+      loadFile(P.fi + 1, 0, false);
+      toast('スリープ：章の終わりで止めました');
+      return;
+    }
+    loadFile(P.fi + 1, 0, true);   // 用意してあれば IndexedDB を待たずにすぐ切り替わる
+    return;
+  }
+  b.finished = true;
+  db.putBook(b).catch(() => { });
+  setProg(b.id, P.fi, b.files[P.fi].duration || audio.duration || 0);
+  clearSleep();
+  renderPlayer();
+  toast('最後まで聞きました');
+}
+
+window.addEventListener('pagehide', saveNow);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveNow();
+  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); }
+});
+
+// ---------------- ロック画面・コントロールセンター ----------------
+
+async function updateMediaMetadata() {
+  if (!('mediaSession' in navigator) || !P.book) return;
+  const b = P.book;
+  const ch = b.chapters[chapterIndexAt(P.fi, curTime())];
+  const art = await coverUrl(b);
+  if (P.book !== b) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: ch ? ch.title : b.title,
+      artist: b.author || b.title,
+      album: b.title,
+      artwork: art ? [{ src: art, sizes: '600x600' }]
+        : [{ src: new URL('icon-512.png', location.href).href, sizes: '512x512', type: 'image/png' }],
+    });
+  } catch { }
+}
+function updatePositionState() {
+  const ms = navigator.mediaSession;
+  if (!ms || !ms.setPositionState) return;
+  const d = audio.duration;
+  if (!isFinite(d) || d <= 0) return;
+  try { ms.setPositionState({ duration: d, playbackRate: audio.playbackRate || 1, position: Math.min(Math.max(0, audio.currentTime), d) }); } catch { }
+}
+(function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch { } };
+  h('play', () => doPlay());
+  h('pause', () => audio.pause());
+  h('seekbackward', (d) => skip(-(d && d.seekOffset || SKIP_BACK)));
+  h('seekforward', (d) => skip(d && d.seekOffset || SKIP_FWD));
+  h('seekto', (d) => { if (d && d.seekTime != null) seekBook(P.fi, d.seekTime); });
+})();
+
+// ---------------- 再生画面 ----------------
+
+function showView(name) {
+  $('library').hidden = name !== 'library';
+  $('player').hidden = name !== 'player';
+  if (name === 'library') renderLibrary();
+  window.scrollTo(0, 0);
+}
+
+function renderPlayer() {
+  const b = P.book;
+  if (!b || $('player').hidden) { renderMini(); return; }
+  fillCoverOnce($('pCover'), b);
+  $('pBook').textContent = b.title;
+  renderTimes();
+  renderPlayState();
+  renderRate();
+  renderSleep();
+}
+function fillCoverOnce(box, b) {
+  if (box.dataset.book === b.id + '|' + b.title) return;
+  box.dataset.book = b.id + '|' + b.title;
+  fillCover(box, b);
+}
+
+function renderTimes() {
+  const b = P.book; if (!b) return;
+  const t = curTime();
+  const i = chapterIndexAt(P.fi, t);
+  const ch = b.chapters[i];
+  const end = chapterEnd(ch);
+  const len = Math.max(0.1, end - ch.start);
+  const inCh = Math.min(len, Math.max(0, t - ch.start));
+  $('pChapter').textContent = ch.title;
+  const seek = $('seek');
+  if (!seeking) seek.value = String(Math.round(inCh / len * 1000));
+  seek.style.setProperty('--p', (seek.value / 10) + '%');
+  $('tCur').textContent = clock(inCh);
+  $('tLeft').textContent = '-' + clock(len - inCh);
+  const left = Math.max(0, (b.duration || 0) - (fileOffset(b, P.fi) + t));
+  const r = rate !== 1 ? `（${rate}倍で ${jaDur(left / rate)}）` : '';
+  $('pBookLeft').textContent = b.chapters.length > 1
+    ? `${i + 1} / ${b.chapters.length}章・本の残り ${jaDur(left)}${r}`
+    : `本の残り ${jaDur(left)}${r}`;
+  $('btnPrev').disabled = false;
+  $('btnNext').disabled = i + 1 >= b.chapters.length;
+}
+
+function renderPlayState() {
+  const playing = !audio.paused;
+  const use = `<use href="#i-${playing ? 'pause' : 'play'}"/>`;
+  $('btnPlay').querySelector('svg').innerHTML = use;
+  $('btnPlay').setAttribute('aria-label', playing ? '一時停止' : '再生');
+  $('miniPlay').querySelector('svg').innerHTML = use;
+  renderMini();
+}
+
+function renderMini() {
+  const b = P.book;
+  const show = !!b && !$('library').hidden;
+  $('mini').hidden = !show;
+  if (!show) return;
+  fillCoverOnce($('miniCover'), b);
+  $('miniTitle').textContent = b.title;
+  const ch = b.chapters[chapterIndexAt(P.fi, curTime())];
+  $('miniSub').textContent = ch ? ch.title : '';
+}
+
+const seekEl = $('seek');
+seekEl.addEventListener('input', () => {
+  seeking = true;
+  const b = P.book; if (!b) return;
+  const ch = b.chapters[chapterIndexAt(P.fi, curTime())];
+  const len = Math.max(0.1, chapterEnd(ch) - ch.start);
+  const inCh = seekEl.value / 1000 * len;
+  seekEl.style.setProperty('--p', (seekEl.value / 10) + '%');
+  $('tCur').textContent = clock(inCh);
+  $('tLeft').textContent = '-' + clock(len - inCh);
+});
+seekEl.addEventListener('change', () => {
+  const b = P.book; if (!b) { seeking = false; return; }
+  const ch = b.chapters[chapterIndexAt(P.fi, curTime())];
+  const len = Math.max(0.1, chapterEnd(ch) - ch.start);
+  const t = ch.start + Math.min(len - 0.5, seekEl.value / 1000 * len);
+  seeking = false;
+  seekBook(ch.file, Math.max(ch.start, t));
+});
+
+$('btnPlay').onclick = togglePlay;
+$('miniPlay').onclick = (e) => { e.stopPropagation(); togglePlay(); };
+$('mini').onclick = () => { showView('player'); renderPlayer(); };
+$('btnBack').onclick = () => showView('library');
+$('btnBack15').onclick = () => skip(-SKIP_BACK);
+$('btnFwd30').onclick = () => skip(SKIP_FWD);
+$('btnPrev').onclick = prevChapter;
+$('btnNext').onclick = nextChapter;
+
+$('btnChapters').onclick = () => {
+  const b = P.book; if (!b) return;
+  const cur = chapterIndexAt(P.fi, curTime());
+  openSheet(body => {
+    body.append(el('h2', null, `章の一覧（${b.chapters.length}章）`));
+    const opts = el('div', 'opts');
+    b.chapters.forEach((ch, i) => {
+      const x = el('button', i === cur ? 'sel' : null);
+      x.append(el('span', null, ch.title), el('span', 'sub', clock(fileOffset(b, ch.file) + ch.start)));
+      x.onclick = () => { closeSheet(); gotoChapter(i); };
+      opts.append(x);
+    });
+    body.append(opts);
+    actions(body, [['閉じる', 'cancel', closeSheet]]);
+    setTimeout(() => { const s = opts.querySelector('.sel'); if (s) s.scrollIntoView({ block: 'center' }); }, 30);
+  });
+};
+
+function renderRate() { $('btnRate').textContent = `速さ ${rate % 1 ? rate : rate.toFixed(1)}×`; }
+$('btnRate').onclick = () => {
+  openSheet(body => {
+    body.append(el('h2', null, '再生の速さ'));
+    const opts = el('div', 'opts');
+    for (const r of RATES) {
+      const x = el('button', r === rate ? 'sel' : null);
+      x.append(el('span', null, `${r % 1 ? r : r.toFixed(1)}×`), el('span', 'sub', r === 1 ? 'ふつう' : ''));
+      x.onclick = () => {
+        rate = r; localStorage.setItem('kk.rate', String(r));
+        audio.defaultPlaybackRate = r; audio.playbackRate = r;
+        closeSheet(); renderRate(); renderTimes();
+      };
+      opts.append(x);
+    }
+    body.append(opts);
+    actions(body, [['閉じる', 'cancel', closeSheet]]);
+  });
+};
+
+function clearSleep() { sleep = { mode: 'off', until: 0 }; renderSleep(); }
+function renderSleep() {
+  const b = $('btnSleep');
+  b.classList.toggle('on', sleep.mode !== 'off');
+  if (sleep.mode === 'time') b.textContent = `スリープ ${clock(Math.max(0, (sleep.until - Date.now()) / 1000))}`;
+  else if (sleep.mode === 'chapter') b.textContent = 'スリープ 章の終わり';
+  else b.textContent = 'スリープ';
+}
+$('btnSleep').onclick = () => {
+  openSheet(body => {
+    body.append(el('h2', null, 'スリープ（自動で止める）'));
+    const opts = el('div', 'opts');
+    const add = (label, sel, fn) => { const x = el('button', sel ? 'sel' : null, label); x.onclick = () => { fn(); closeSheet(); renderSleep(); }; opts.append(x); };
+    add('オフ', sleep.mode === 'off', () => { sleep = { mode: 'off', until: 0 }; });
+    for (const m of SLEEPS) add(`${m}分後`, false, () => { sleep = { mode: 'time', until: Date.now() + m * 60000 }; });
+    add('この章の終わり', sleep.mode === 'chapter', () => { sleep = { mode: 'chapter', until: 0 }; P.chapterIdx = chapterIndexAt(P.fi, curTime()); });
+    body.append(opts);
+    actions(body, [['閉じる', 'cancel', closeSheet]]);
+  });
+};
+setInterval(() => {
+  if (sleep.mode === 'time') {
+    if (Date.now() >= sleep.until && !audio.paused) { audio.pause(); clearSleep(); toast('スリープ：止めました'); }
+    else if (!$('player').hidden) renderSleep();
+  }
+}, 1000);
+
+// キーボード（iPad のキーボード用）
+document.addEventListener('keydown', (e) => {
+  if (!P.book || e.target.tagName === 'INPUT' || !$('sheet').hidden) return;
+  if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'ArrowLeft') skip(-SKIP_BACK);
+  else if (e.key === 'ArrowRight') skip(SKIP_FWD);
+});
+
+// ---------------- はじめ ----------------
+
+function isStandalone() {
+  return navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+}
+
+async function start() {
+  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  $('installHint').hidden = !(ios && !isStandalone());
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
+  try {
+    await refreshLibrary();
+  } catch (e) {
+    $('empty').hidden = false;
+    toast(`本棚を開けませんでした：${e && e.message || e}`, 8000);
+  }
+  // 前回聞いていた本をすぐ再開できるように用意だけしておく（自動では鳴らさない）
+  const last = localStorage.getItem('kk.last');
+  const b = books.find(x => x.id === last);
+  if (b && !b.finished) {
+    P.book = b; P.chapterIdx = -1;
+    const pr = getProg(b.id);
+    const fi = pr ? Math.min(Math.max(0, pr.f | 0), b.files.length - 1) : 0;
+    P.fi = fi; P.pendingSeek = pr ? pr.t : 0;
+    renderMini();
+    loadFile(fi, pr ? pr.t : 0, false);
+  }
+}
+audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
+
+// テスト用（画面の外からの確認）
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; } };
+
+start();

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFE7D1"/>
+      <stop offset="1" stop-color="#FFD3B3"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- 耳 -->
+  <g stroke="#4A3B35" stroke-width="9">
+    <ellipse cx="196" cy="150" rx="44" ry="112" transform="rotate(-12 196 230)" fill="#FFFFFF"/>
+    <ellipse cx="316" cy="150" rx="44" ry="112" transform="rotate(12 316 230)" fill="#FFFFFF"/>
+  </g>
+  <ellipse cx="196" cy="156" rx="20" ry="80" transform="rotate(-12 196 230)" fill="#F7AFC0"/>
+  <ellipse cx="316" cy="156" rx="20" ry="80" transform="rotate(12 316 230)" fill="#F7AFC0"/>
+  <!-- 顔 -->
+  <ellipse cx="256" cy="334" rx="134" ry="118" fill="#FFFFFF" stroke="#4A3B35" stroke-width="9"/>
+  <!-- ヘッドホン -->
+  <path d="M124 330 C 120 168, 392 168, 388 330" fill="none" stroke="#2F6FD6" stroke-width="24" stroke-linecap="round"/>
+  <rect x="98" y="292" width="52" height="96" rx="22" fill="#2F6FD6" stroke="#1F4FA3" stroke-width="6"/>
+  <rect x="362" y="292" width="52" height="96" rx="22" fill="#2F6FD6" stroke="#1F4FA3" stroke-width="6"/>
+  <!-- 目（気持ちよさそうに閉じた目） -->
+  <path d="M200 328 q 18 16 36 0" fill="none" stroke="#4A3B35" stroke-width="9" stroke-linecap="round"/>
+  <path d="M276 328 q 18 16 36 0" fill="none" stroke="#4A3B35" stroke-width="9" stroke-linecap="round"/>
+  <!-- ほっぺ -->
+  <circle cx="190" cy="366" r="17" fill="#F7AFC0" opacity=".8"/>
+  <circle cx="322" cy="366" r="17" fill="#F7AFC0" opacity=".8"/>
+  <!-- 鼻・口 -->
+  <ellipse cx="256" cy="360" rx="12" ry="8" fill="#EE8AA0"/>
+  <path d="M256 368 q -6 14 -20 10 M256 368 q 6 14 20 10" fill="none" stroke="#4A3B35" stroke-width="6" stroke-linecap="round"/>
+  <!-- 音の波 -->
+  <path d="M436 300 q 20 40 0 80" fill="none" stroke="#2F6FD6" stroke-width="10" stroke-linecap="round"/>
+  <path d="M460 282 q 32 58 0 116" fill="none" stroke="#2F6FD6" stroke-width="10" stroke-linecap="round" opacity=".55"/>
+</svg>

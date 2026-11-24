@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="ききウサ">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#FBF7F2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1C1B1F" media="(prefers-color-scheme: dark)">
+<title>ききウサ</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4.2" height="14" rx="1.2" fill="currentColor"/><rect x="13.8" y="5" width="4.2" height="14" rx="1.2" fill="currentColor"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><rect x="5" y="5" width="2.6" height="14" rx="1" fill="currentColor"/><path d="M19 6.2v11.6a.9.9 0 0 1-1.4.75L9.2 12.75a.9.9 0 0 1 0-1.5l8.4-5.8A.9.9 0 0 1 19 6.2z" fill="currentColor"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><rect x="16.4" y="5" width="2.6" height="14" rx="1" fill="currentColor"/><path d="M5 6.2v11.6a.9.9 0 0 0 1.4.75l8.4-5.8a.9.9 0 0 0 0-1.5L6.4 5.45A.9.9 0 0 0 5 6.2z" fill="currentColor"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M12 4.5a7.5 7.5 0 1 1-7.3 9.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M12 1.8v5.4L8.4 4.5z" fill="currentColor"/></symbol>
+    <symbol id="i-fwd" viewBox="0 0 24 24"><path d="M12 4.5a7.5 7.5 0 1 0 7.3 9.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M12 1.8v5.4l3.6-2.7z" fill="currentColor"/></symbol>
+  </defs>
+</svg>
+
+<!-- 本棚 -->
+<section id="library" class="view">
+  <header class="bar">
+    <h1 class="brand"><img src="icon-192.png" alt="" width="34" height="34">ききウサ</h1>
+    <button id="btnImport" class="primary">＋ 本を取り込む</button>
+  </header>
+  <div id="installHint" class="hint" hidden>
+    <b>はじめに：ホーム画面に追加してください。</b>
+    Safari の共有ボタン <span class="share">⬆︎</span> →「ホーム画面に追加」で追加し、ホーム画面の「ききウサ」から本を取り込みます（Safari で取り込んだ本は、ホーム画面のききウサからは見えません）。
+  </div>
+  <main class="lib-main">
+    <div id="books" class="grid"></div>
+    <div id="empty" class="empty" hidden>
+      <div class="empty-title">本棚はまだ空です</div>
+      <ol>
+        <li>右上の「＋ 本を取り込む」を押し、「ファイルを選択」を選びます。</li>
+        <li>「ブラウズ」→ 場所の「OneDrive」→ Documents › Yomiage › MP3 › 本のフォルダを開きます。</li>
+        <li>「選択」を押して、オーディオブック（.m4b）か MP3 をまとめて選び、「開く」を押します。cover.jpg も一緒に選ぶと表紙になります。</li>
+      </ol>
+      <p class="muted">取り込んだ本は iPad の中に保存されるので、ネットがない場所でも聞けます。OneDrive のファイルはそのまま残ります。</p>
+    </div>
+  </main>
+  <footer class="foot"><span id="storage"></span><span id="version" class="muted"></span></footer>
+  <div id="mini" class="mini" hidden>
+    <div id="miniCover" class="cover mini-cover"></div>
+    <div class="mini-text"><div id="miniTitle" class="mini-title"></div><div id="miniSub" class="mini-sub"></div></div>
+    <button id="miniPlay" class="icon-btn" aria-label="再生"><svg><use href="#i-play"/></svg></button>
+  </div>
+  <input type="file" id="fileInput" multiple hidden>
+</section>
+
+<!-- 再生 -->
+<section id="player" class="view" hidden>
+  <header class="bar">
+    <button id="btnBack" class="ghost">‹ 本棚</button>
+    <div class="spacer"></div>
+    <button id="btnChapters" class="ghost">章の一覧</button>
+  </header>
+  <div class="player-body">
+    <div class="cover-wrap"><div id="pCover" class="cover big"></div></div>
+    <div class="controls">
+      <div id="pBook" class="p-book"></div>
+      <div id="pChapter" class="p-chapter"></div>
+      <input type="range" id="seek" min="0" max="1000" value="0" step="1" aria-label="再生位置">
+      <div class="times"><span id="tCur">0:00</span><span id="tLeft">-0:00</span></div>
+      <div id="pBookLeft" class="p-left"></div>
+      <div class="transport">
+        <button id="btnPrev" class="icon-btn" aria-label="前の章"><svg><use href="#i-prev"/></svg></button>
+        <button id="btnBack15" class="icon-btn skip" aria-label="15秒戻る"><svg><use href="#i-back"/></svg><span>15</span></button>
+        <button id="btnPlay" class="play" aria-label="再生"><svg><use href="#i-play"/></svg></button>
+        <button id="btnFwd30" class="icon-btn skip" aria-label="30秒進む"><svg><use href="#i-fwd"/></svg><span>30</span></button>
+        <button id="btnNext" class="icon-btn" aria-label="次の章"><svg><use href="#i-next"/></svg></button>
+      </div>
+      <div class="row2">
+        <button id="btnRate" class="pill">速さ 1.0×</button>
+        <button id="btnSleep" class="pill">スリープ</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true"><div id="sheetBody"></div></div>
+</div>
+<div id="busy" class="busy" hidden>
+  <div class="busy-panel"><div id="busyText"></div><progress id="busyBar" max="1" value="0"></progress></div>
+</div>
+<div id="toast" class="toast" hidden></div>
+<audio id="audio" preload="auto"></audio>
+<script type="module" src="app.js"></script>
+</body>
+</html>
