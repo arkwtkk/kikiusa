@@ -3,6 +3,7 @@
 
 export const AUDIO_EXT = ['mp3', 'm4b', 'm4a', 'aac', 'wav', 'flac'];
 export const IMAGE_EXT = ['jpg', 'jpeg', 'png'];
+export const SUB_EXT = ['vtt', 'srt'];
 
 export function extOf(name) {
   const m = /\.([^.\/\\]+)$/.exec(name || '');
@@ -283,4 +284,46 @@ async function mp3Duration(blob, start) {
     return (blob.size - start - i) * 8 / (kbps * 1000);
   }
   return 0;
+}
+
+// ---------------- 字幕（WebVTT / SRT） ----------------
+
+function subTime(s) {
+  const m = /(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/.exec(s || '');
+  if (!m) return NaN;
+  return (+(m[1] || 0)) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4].padEnd(3, '0')) / 1000;
+}
+
+// [[開始秒, 終了秒, 文], ...]（開始の順）
+export function parseSubtitles(text) {
+  const out = [];
+  const blocks = String(text || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n').split(/\n[ \t]*\n/);
+  for (const b of blocks) {
+    const lines = b.split('\n');
+    const i = lines.findIndex(l => l.includes('-->'));
+    if (i < 0) continue;
+    const [a, z] = lines[i].split('-->');
+    const s = subTime(a), e = subTime(z);
+    if (!isFinite(s) || !isFinite(e)) continue;
+    const t = lines.slice(i + 1).join('\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+      .trim();
+    if (t) out.push([Math.round(s * 1000) / 1000, Math.round(Math.max(e, s) * 1000) / 1000, t]);
+  }
+  out.sort((x, y) => x[0] - y[0]);
+  return out;
+}
+
+// t 秒に出す字幕（なければ null）。少しの切れ目なら前の字幕を出したままにする
+export function cueAt(cues, t, hold = 0.8) {
+  if (!cues || !cues.length) return null;
+  let lo = 0, hi = cues.length - 1, idx = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (cues[mid][0] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (idx < 0) return null;
+  const c = cues[idx];
+  return t < c[1] + hold ? c : null;
 }

@@ -114,7 +114,7 @@ input { font: inherit; }
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 26px;
   padding: 10px calc(env(safe-area-inset-right) + 28px) calc(env(safe-area-inset-bottom) + 28px) calc(env(safe-area-inset-left) + 28px);
 }
-.cover-wrap { width: min(72vw, 48vh, 560px); }
+.cover-wrap { width: min(72vw, 48vh, 560px); position: relative; }
 .cover.big { width: 100%; aspect-ratio: 1; border-radius: 18px; box-shadow: 0 10px 40px rgba(40, 30, 20, .22); }
 .controls { width: min(100%, 560px); display: flex; flex-direction: column; align-items: stretch; }
 .p-book { font-size: 15px; color: var(--muted); text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -182,3 +182,15 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
   max-width: min(560px, 90vw); padding: 11px 18px; border-radius: 14px;
   background: rgba(30, 28, 26, .92); color: #fff; font-size: 15px; text-align: center;
 }
+
+/* 字幕（映画の字幕のように表紙の下側に重ねる） */
+.subtitle {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 36px 18px 16px; border-radius: 0 0 18px 18px;
+  background: linear-gradient(to bottom, transparent, rgba(0, 0, 0, .55) 38%, rgba(0, 0, 0, .72));
+  color: #fff; font-size: clamp(17px, 2.5vw, 23px); font-weight: 600; line-height: 1.5;
+  text-align: center; text-shadow: 0 1px 3px rgba(0, 0, 0, .6);
+  white-space: pre-line; word-break: normal; line-break: strict; pointer-events: none;
+}
+.row2 { flex-wrap: wrap; }
+.row2 .pill { min-width: 112px; }

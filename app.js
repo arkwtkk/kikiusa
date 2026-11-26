@@ -1,8 +1,8 @@
 // app.js — ききウサ（iPad 用オーディオブックプレーヤー）
-import { AUDIO_EXT, IMAGE_EXT, extOf, baseName, mimeOf, parseAudioMeta } from './parse.js';
+import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta, parseSubtitles, cueAt } from './parse.js';
 import * as db from './db.js';
 
-const VERSION = '0.1';
+const VERSION = '0.2';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -17,6 +17,7 @@ const P = {                       // 再生中の状態
   lastSave: 0, pausedAt: 0, next: null, loadToken: 0, seekTries: 0, playAfterSeek: false,
 };
 let rate = Number(localStorage.getItem('kk.rate')) || 1;
+let subsOn = localStorage.getItem('kk.subs') !== '0';
 let sleep = { mode: 'off', until: 0 };   // off | time | chapter
 let seeking = false;
 
@@ -187,6 +188,17 @@ function bookMenu(b) {
     add(b.finished ? '「聞き終わり」を外す' : '聞き終わりにする', async () => {
       closeSheet(); b.finished = !b.finished; await db.putBook(b); renderLibrary();
     });
+    add(hasSubs(b) ? '字幕を入れ替える' : '字幕を追加', () => {
+      closeSheet(); subTarget = b;
+      const i = $('subInput'); i.value = ''; i.click();
+    });
+    if (hasSubs(b)) add('字幕を外す', async () => {
+      closeSheet();
+      b.files.forEach(f => { delete f.cues; });
+      await db.putBook(b);
+      if (P.book && P.book.id === b.id) renderPlayer();
+      toast('字幕を外しました');
+    });
     add('削除する', () => confirmDelete(b), 'danger');
     body.append(info, opts);
     actions(body, [['閉じる', 'cancel', closeSheet]]);
@@ -233,6 +245,38 @@ function confirmDelete(b) {
 
 $('btnImport').onclick = () => { const i = $('fileInput'); i.value = ''; i.click(); };
 $('fileInput').onchange = (e) => { const files = [...e.target.files]; if (files.length) planImport(files); };
+$('subInput').onchange = (e) => {
+  const files = [...e.target.files];
+  const b = subTarget; subTarget = null;
+  if (b && files.length) addSubsToBook(b, files);
+};
+
+// 音声ファイルと同じ名前の字幕を探す。1ファイルの本で字幕が1つだけなら名前が違っても使う
+function matchSubs(audioFiles, subs) {
+  const out = audioFiles.map(f => subs.find(x => baseName(x.name) === baseName(f.name)) || null);
+  if (audioFiles.length === 1 && !out[0] && subs.length === 1) out[0] = subs[0];
+  return out;
+}
+function hasSubs(book) { return !!book && book.files.some(f => f.cues && f.cues.length); }
+
+let subTarget = null;
+async function addSubsToBook(book, files) {
+  const subs = files.filter(f => SUB_EXT.includes(extOf(f.name)));
+  if (!subs.length) { toast('字幕ファイル（.vtt・.srt）が選ばれていません'); return; }
+  const matched = matchSubs(book.files, subs);
+  let n = 0, cueCount = 0;
+  for (const [i, sf] of matched.entries()) {
+    if (!sf) continue;
+    const cues = parseSubtitles(await sf.text().catch(() => ''));
+    if (!cues.length) continue;
+    book.files[i].cues = cues; n++; cueCount += cues.length;
+  }
+  if (!n) { toast('この本の音声と同じ名前の字幕がありませんでした', 5000); return; }
+  await db.putBook(book);
+  if (P.book && P.book.id === book.id) { P.book = book; renderPlayer(); }
+  renderLibrary();
+  toast(`字幕を付けました（${cueCount}件）`);
+}
 
 function stripNum(s) { return s.replace(/^\s*\d+\s*[_\-.\s]\s*/, '').trim() || s; }
 function sameFiles(book, files) {
@@ -259,7 +303,11 @@ function groupTitle(files, metas) {
 async function planImport(files) {
   const audios = files.filter(f => AUDIO_EXT.includes(extOf(f.name)));
   const images = files.filter(f => IMAGE_EXT.includes(extOf(f.name)));
-  if (!audios.length) { toast('音声ファイル（.m4b・.mp3 など）が選ばれていません'); return; }
+  const subs = files.filter(f => SUB_EXT.includes(extOf(f.name)));
+  if (!audios.length) {
+    toast(subs.length ? '字幕だけを足すときは、本の「…」→「字幕を追加」から選んでください' : '音声ファイル（.m4b・.mp3 など）が選ばれていません', 5000);
+    return;
+  }
   showBusy('ファイルを調べています…');
   const metas = new Map();
   for (const f of audios) metas.set(f, await parseAudioMeta(f, f.name).catch(() => ({})));
@@ -283,6 +331,7 @@ async function planImport(files) {
     p.chapterCount = p.files.reduce((s, f) => s + Math.max(1, (metas.get(f).chapters || []).length), 0);
     p.duration = p.files.reduce((s, f) => s + (metas.get(f).duration || 0), 0);
     p.bytes = p.files.reduce((s, f) => s + f.size, 0);
+    p.subs = matchSubs(p.files, subs);
     p.dup = books.some(b => sameFiles(b, p.files));
     p.include = !p.dup;
   }
@@ -303,6 +352,7 @@ function showImportSheet(plans, metas) {
       if (p.duration) parts.push(jaDur(p.duration));
       parts.push(size(p.bytes));
       parts.push(p.coverFile || p.embedded ? '表紙あり' : '表紙なし');
+      if (p.subs.some(Boolean)) parts.push('字幕あり');
       main.append(name, el('div', 'plan-meta', parts.join('・')));
       if (p.dup) main.append(el('div', 'plan-warn', '同じ本がもう本棚にあります（取り込むと2冊になります）'));
       row.append(cb, main);
@@ -373,7 +423,12 @@ async function doImport(plans, metas) {
         saved.push(blobId);
         let dur = m.duration || 0;
         if (!dur) dur = await measureDuration(blob);
-        files.push({ blobId, name: f.name, size: f.size, type: blob.type, duration: dur });
+        const entry = { blobId, name: f.name, size: f.size, type: blob.type, duration: dur };
+        if (p.subs && p.subs[j]) {
+          const cues = parseSubtitles(await p.subs[j].text().catch(() => ''));
+          if (cues.length) entry.cues = cues;
+        }
+        files.push(entry);
       }
       let coverId = null;
       const coverBlob = p.coverFile ? new Blob([p.coverFile], { type: mimeOf(p.coverFile.name) }) : p.embedded;
@@ -705,6 +760,7 @@ function renderPlayer() {
   renderPlayState();
   renderRate();
   renderSleep();
+  renderSubsButton();
 }
 function fillCoverOnce(box, b) {
   if (box.dataset.book === b.id + '|' + b.title) return;
@@ -733,6 +789,7 @@ function renderTimes() {
     : `本の残り ${jaDur(left)}${r}`;
   $('btnPrev').disabled = false;
   $('btnNext').disabled = i + 1 >= b.chapters.length;
+  renderSubtitle();
 }
 
 function renderPlayState() {
@@ -800,6 +857,33 @@ $('btnChapters').onclick = () => {
     actions(body, [['閉じる', 'cancel', closeSheet]]);
     setTimeout(() => { const s = opts.querySelector('.sel'); if (s) s.scrollIntoView({ block: 'center' }); }, 30);
   });
+};
+
+// 字幕（映画の字幕のように表紙の下側に出す）
+let subShown = null;
+function renderSubtitle() {
+  const box = $('subtitle');
+  const f = P.book && P.book.files[P.fi];
+  const c = subsOn && f && f.cues ? cueAt(f.cues, curTime()) : null;
+  const text = c ? c[2] : '';
+  if (text === subShown) return;
+  subShown = text;
+  box.textContent = text;
+  box.hidden = !text;
+}
+function renderSubsButton() {
+  const b = $('btnSubs');
+  const has = hasSubs(P.book);
+  b.hidden = !has;
+  b.classList.toggle('on', has && subsOn);
+  b.textContent = subsOn ? '字幕 あり' : '字幕 なし';
+  subShown = null;
+  renderSubtitle();
+}
+$('btnSubs').onclick = () => {
+  subsOn = !subsOn;
+  localStorage.setItem('kk.subs', subsOn ? '1' : '0');
+  renderSubsButton();
 };
 
 function renderRate() { $('btnRate').textContent = `速さ ${rate % 1 ? rate : rate.toFixed(1)}×`; }
@@ -888,6 +972,6 @@ async function start() {
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; } };
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; } };
 
 start();

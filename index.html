@@ -56,6 +56,7 @@
     <button id="miniPlay" class="icon-btn" aria-label="再生"><svg><use href="#i-play"/></svg></button>
   </div>
   <input type="file" id="fileInput" multiple hidden>
+  <input type="file" id="subInput" multiple hidden>
 </section>
 
 <!-- 再生 -->
@@ -66,7 +67,7 @@
     <button id="btnChapters" class="ghost">章の一覧</button>
   </header>
   <div class="player-body">
-    <div class="cover-wrap"><div id="pCover" class="cover big"></div></div>
+    <div class="cover-wrap"><div id="pCover" class="cover big"></div><div id="subtitle" class="subtitle" hidden></div></div>
     <div class="controls">
       <div id="pBook" class="p-book"></div>
       <div id="pChapter" class="p-chapter"></div>
@@ -83,6 +84,7 @@
       <div class="row2">
         <button id="btnRate" class="pill">速さ 1.0×</button>
         <button id="btnSleep" class="pill">スリープ</button>
+        <button id="btnSubs" class="pill" hidden>字幕 あり</button>
       </div>
     </div>
   </div>
