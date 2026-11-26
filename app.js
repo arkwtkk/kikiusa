@@ -1,8 +1,9 @@
 // app.js — ききウサ（iPad 用オーディオブックプレーヤー）
-import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta, parseSubtitles, cueAt } from './parse.js';
+import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta, parseSubtitles, cueAt,
+  isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt } from './parse.js';
 import * as db from './db.js';
 
-const VERSION = '0.2';
+const VERSION = '0.3';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -18,6 +19,7 @@ const P = {                       // 再生中の状態
 };
 let rate = Number(localStorage.getItem('kk.rate')) || 1;
 let subsOn = localStorage.getItem('kk.subs') !== '0';
+let imgsOn = localStorage.getItem('kk.imgs') !== '0';
 let sleep = { mode: 'off', until: 0 };   // off | time | chapter
 let seeking = false;
 
@@ -188,7 +190,7 @@ function bookMenu(b) {
     add(b.finished ? '「聞き終わり」を外す' : '聞き終わりにする', async () => {
       closeSheet(); b.finished = !b.finished; await db.putBook(b); renderLibrary();
     });
-    add(hasSubs(b) ? '字幕を入れ替える' : '字幕を追加', () => {
+    add('字幕・写真を追加', () => {
       closeSheet(); subTarget = b;
       const i = $('subInput'); i.value = ''; i.click();
     });
@@ -198,6 +200,16 @@ function bookMenu(b) {
       await db.putBook(b);
       if (P.book && P.book.id === b.id) renderPlayer();
       toast('字幕を外しました');
+    });
+    if (hasImages(b)) add('写真を外す', async () => {
+      closeSheet();
+      const ids = b.images.map(x => x.blobId);
+      delete b.images;
+      await db.putBook(b);
+      await db.deleteBlobs(ids).catch(() => { });
+      if (P.book && P.book.id === b.id) renderPlayer();
+      renderLibrary();
+      toast('写真を外しました');
     });
     add('削除する', () => confirmDelete(b), 'danger');
     body.append(info, opts);
@@ -248,7 +260,7 @@ $('fileInput').onchange = (e) => { const files = [...e.target.files]; if (files.
 $('subInput').onchange = (e) => {
   const files = [...e.target.files];
   const b = subTarget; subTarget = null;
-  if (b && files.length) addSubsToBook(b, files);
+  if (b && files.length) addExtrasToBook(b, files);
 };
 
 // 音声ファイルと同じ名前の字幕を探す。1ファイルの本で字幕が1つだけなら名前が違っても使う
@@ -259,23 +271,81 @@ function matchSubs(audioFiles, subs) {
 }
 function hasSubs(book) { return !!book && book.files.some(f => f.cues && f.cues.length); }
 
-let subTarget = null;
-async function addSubsToBook(book, files) {
-  const subs = files.filter(f => SUB_EXT.includes(extOf(f.name)));
-  if (!subs.length) { toast('字幕ファイル（.vtt・.srt）が選ばれていません'); return; }
-  const matched = matchSubs(book.files, subs);
-  let n = 0, cueCount = 0;
-  for (const [i, sf] of matched.entries()) {
-    if (!sf) continue;
-    const cues = parseSubtitles(await sf.text().catch(() => ''));
-    if (!cues.length) continue;
-    book.files[i].cues = cues; n++; cueCount += cues.length;
+function hasImages(book) { return !!book && Array.isArray(book.images) && book.images.length > 0; }
+
+// 写真の包み（<本>.images.zip）を読み、本の音声ファイルに割り当てる（まだ保存しない）
+async function readImagePack(zipFile, audioNames) {
+  const entries = await readZip(zipFile);
+  const man = entries.find(e => /(^|\/)images\.json$/i.test(e.name));
+  if (!man) throw new Error('images.json がありません');
+  const list = parseImageManifest(await (await zipEntryBlob(zipFile, man)).text());
+  const items = [];
+  for (const x of list) {
+    let fi = -1;
+    if (x.audio) fi = audioNames.findIndex(n => n === x.audio || baseName(n) === baseName(x.audio));
+    else if (audioNames.length === 1) fi = 0;
+    if (fi < 0) continue;
+    const ent = entries.find(e => e.name === x.file) || entries.find(e => e.name.split('/').pop() === x.file);
+    if (!ent || !IMAGE_EXT.includes(extOf(ent.name))) continue;
+    items.push({ ...x, fi, entry: ent });
   }
-  if (!n) { toast('この本の音声と同じ名前の字幕がありませんでした', 5000); return; }
+  return { zipFile, items };
+}
+async function saveImagePack(bookId, pack, saved) {
+  const out = [];
+  const tag = Date.now().toString(36);
+  for (const [k, x] of pack.items.entries()) {
+    const blob = await zipEntryBlob(pack.zipFile, x.entry, mimeOf(x.entry.name));
+    const blobId = `${bookId}.img${tag}_${k}`;
+    await db.putBlob(blobId, blob);
+    saved.push(blobId);
+    out.push({ blobId, file: x.fi, s: x.s, e: x.e, caption: x.caption });
+  }
+  out.sort((a, b) => a.file - b.file || a.s - b.s);
+  return out;
+}
+function findPack(names, packs, allowSingle) {
+  return packs.find(z => names.includes(imagePackBase(z.name))) || (allowSingle && packs.length === 1 ? packs[0] : null);
+}
+
+let subTarget = null;
+async function addExtrasToBook(book, files) {
+  const subs = files.filter(f => SUB_EXT.includes(extOf(f.name)));
+  const packs = files.filter(f => isImagePack(f.name));
+  if (!subs.length && !packs.length) { toast('字幕（.vtt・.srt）か写真の包み（.images.zip）を選んでください', 5000); return; }
+  const msgs = [];
+  if (subs.length) {
+    const matched = matchSubs(book.files, subs);
+    let cueCount = 0;
+    for (const [i, sf] of matched.entries()) {
+      if (!sf) continue;
+      const cues = parseSubtitles(await sf.text().catch(() => ''));
+      if (!cues.length) continue;
+      book.files[i].cues = cues; cueCount += cues.length;
+    }
+    msgs.push(cueCount ? `字幕 ${cueCount}件` : '字幕は合う名前がありませんでした');
+  }
+  if (packs.length) {
+    const z = findPack([book.title, ...book.files.map(f => baseName(f.name))], packs, true);
+    const saved = [];
+    try {
+      showBusy('写真を取り込んでいます…');
+      const pack = await readImagePack(z, book.files.map(f => f.name));
+      if (!pack.items.length) throw new Error('この本の音声に合う写真がありません');
+      const old = (book.images || []).map(x => x.blobId);
+      book.images = await saveImagePack(book.id, pack, saved);
+      await db.putBook(book);
+      await db.deleteBlobs(old).catch(() => { });
+      msgs.push(`写真 ${book.images.length}枚`);
+    } catch (e) {
+      await db.deleteBlobs(saved).catch(() => { });
+      msgs.push(`写真は取り込めませんでした（${e && e.message || e}）`);
+    } finally { hideBusy(); }
+  }
   await db.putBook(book);
   if (P.book && P.book.id === book.id) { P.book = book; renderPlayer(); }
   renderLibrary();
-  toast(`字幕を付けました（${cueCount}件）`);
+  toast(msgs.join('・'), 5000);
 }
 
 function stripNum(s) { return s.replace(/^\s*\d+\s*[_\-.\s]\s*/, '').trim() || s; }
@@ -304,8 +374,9 @@ async function planImport(files) {
   const audios = files.filter(f => AUDIO_EXT.includes(extOf(f.name)));
   const images = files.filter(f => IMAGE_EXT.includes(extOf(f.name)));
   const subs = files.filter(f => SUB_EXT.includes(extOf(f.name)));
+  const packs = files.filter(f => isImagePack(f.name));
   if (!audios.length) {
-    toast(subs.length ? '字幕だけを足すときは、本の「…」→「字幕を追加」から選んでください' : '音声ファイル（.m4b・.mp3 など）が選ばれていません', 5000);
+    toast(subs.length || packs.length ? '字幕・写真だけを足すときは、本の「…」→「字幕・写真を追加」から選んでください' : '音声ファイル（.m4b・.mp3 など）が選ばれていません', 5000);
     return;
   }
   showBusy('ファイルを調べています…');
@@ -332,6 +403,12 @@ async function planImport(files) {
     p.duration = p.files.reduce((s, f) => s + (metas.get(f).duration || 0), 0);
     p.bytes = p.files.reduce((s, f) => s + f.size, 0);
     p.subs = matchSubs(p.files, subs);
+    p.pack = null;
+    const z = findPack([p.title, ...p.files.map(f => baseName(f.name))], packs, plans.length === 1);
+    if (z) {
+      try { p.pack = await readImagePack(z, p.files.map(f => f.name)); }
+      catch (e) { p.packError = String(e && e.message || e); }
+    }
     p.dup = books.some(b => sameFiles(b, p.files));
     p.include = !p.dup;
   }
@@ -353,8 +430,10 @@ function showImportSheet(plans, metas) {
       parts.push(size(p.bytes));
       parts.push(p.coverFile || p.embedded ? '表紙あり' : '表紙なし');
       if (p.subs.some(Boolean)) parts.push('字幕あり');
+      if (p.pack && p.pack.items.length) parts.push(`写真${p.pack.items.length}枚`);
       main.append(name, el('div', 'plan-meta', parts.join('・')));
       if (p.dup) main.append(el('div', 'plan-warn', '同じ本がもう本棚にあります（取り込むと2冊になります）'));
+      if (p.packError) main.append(el('div', 'plan-warn', `写真の包みを読めませんでした：${p.packError}`));
       row.append(cb, main);
       body.append(row);
     }
@@ -439,6 +518,10 @@ async function doImport(plans, metas) {
         chapters: buildChapters(files, p.files.map(f => metas.get(f))),
         duration: files.reduce((s, f) => s + (f.duration || 0), 0),
       };
+      if (p.pack && p.pack.items.length) {
+        showBusy(`取り込み中 ${pi + 1}/${plans.length}：${p.title}（写真）`, 1);
+        book.images = await saveImagePack(id, p.pack, saved);
+      }
       await db.putBook(book);
       made++;
     } catch (e) {
@@ -761,6 +844,7 @@ function renderPlayer() {
   renderRate();
   renderSleep();
   renderSubsButton();
+  renderImgsButton();
 }
 function fillCoverOnce(box, b) {
   if (box.dataset.book === b.id + '|' + b.title) return;
@@ -790,6 +874,7 @@ function renderTimes() {
   $('btnPrev').disabled = false;
   $('btnNext').disabled = i + 1 >= b.chapters.length;
   renderSubtitle();
+  renderSlide();
 }
 
 function renderPlayState() {
@@ -886,6 +971,68 @@ $('btnSubs').onclick = () => {
   renderSubsButton();
 };
 
+// 写真・図表（表紙の場所に出す。ゆっくりズーム、押すと全画面）
+const imgUrls = new Map();   // blobId -> object URL（最近の数枚だけ）
+let slideShown = null;
+async function imageUrl(id) {
+  if (imgUrls.has(id)) return imgUrls.get(id);
+  const b = await db.getBlob(id).catch(() => null);
+  if (!b) return null;
+  const u = URL.createObjectURL(b);
+  imgUrls.set(id, u);
+  for (const [k, v] of imgUrls) {
+    if (imgUrls.size <= 6) break;
+    if (k !== slideShown && k !== id) { URL.revokeObjectURL(v); imgUrls.delete(k); }
+  }
+  return u;
+}
+function currentImage() {
+  const b = P.book;
+  if (!imgsOn || !hasImages(b)) return null;
+  return imageAt(b.images.filter(x => x.file === P.fi), curTime());
+}
+function renderSlide() {
+  const x = currentImage();
+  const id = x ? x.blobId : null;
+  if (id === slideShown) return;
+  slideShown = id;
+  const box = $('slide');
+  if (!x) { box.hidden = true; $('slideImg').removeAttribute('src'); return; }
+  imageUrl(id).then(u => {
+    if (slideShown !== id) return;
+    if (!u) { box.hidden = true; return; }
+    const img = $('slideImg');
+    img.classList.remove('kb');
+    img.src = u;
+    void img.offsetWidth;
+    img.classList.add('kb');
+    $('slideCap').textContent = x.caption || '';
+    $('slideCap').hidden = !x.caption;
+    box.hidden = false;
+  });
+}
+function renderImgsButton() {
+  const b = $('btnImgs');
+  const has = hasImages(P.book);
+  b.hidden = !has;
+  b.classList.toggle('on', has && imgsOn);
+  b.textContent = imgsOn ? '写真 あり' : '写真 なし';
+  slideShown = undefined;
+  renderSlide();
+}
+$('btnImgs').onclick = () => {
+  imgsOn = !imgsOn;
+  localStorage.setItem('kk.imgs', imgsOn ? '1' : '0');
+  renderImgsButton();
+};
+$('slide').onclick = () => {
+  if (!slideShown || !$('slideImg').src) return;
+  $('viewerImg').src = $('slideImg').src;
+  $('viewerCap').textContent = $('slideCap').hidden ? '' : $('slideCap').textContent;
+  $('viewer').hidden = false;
+};
+$('viewer').onclick = () => { $('viewer').hidden = true; };
+
 function renderRate() { $('btnRate').textContent = `速さ ${rate % 1 ? rate : rate.toFixed(1)}×`; }
 $('btnRate').onclick = () => {
   openSheet(body => {
@@ -972,6 +1119,6 @@ async function start() {
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; } };
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; } };
 
 start();

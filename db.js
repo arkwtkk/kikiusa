@@ -71,6 +71,6 @@ export function deleteBlobs(ids) {
 }
 
 export async function deleteBook(book) {
-  await deleteBlobs([...(book.files || []).map(f => f.blobId), book.coverId]);
+  await deleteBlobs([...(book.files || []).map(f => f.blobId), book.coverId, ...(book.images || []).map(x => x.blobId)]);
   await run('books', 'readwrite', s => s.delete(book.id));
 }

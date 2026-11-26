@@ -327,3 +327,74 @@ export function cueAt(cues, t, hold = 0.8) {
   const c = cues[idx];
   return t < c[1] + hold ? c : null;
 }
+
+// ---------------- 写真・図表の包み（<本>.images.zip ＝ images.json ＋ 画像） ----------------
+
+export function isImagePack(name) { return /\.images\.zip$/i.test(name || ''); }
+export function imagePackBase(name) { return String(name || '').split(/[\/\\]/).pop().replace(/\.images\.zip$/i, ''); }
+
+function le16(b, o) { return b[o] | (b[o + 1] << 8); }
+function le32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) + b[o + 3] * 16777216; }
+
+// zip の中身の一覧（無圧縮・deflate。zip64 は扱わない）
+export async function readZip(blob) {
+  const tailLen = Math.min(blob.size, 65557);
+  const tail = await readSlice(blob, blob.size - tailLen, blob.size);
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 5 && tail[i + 3] === 6) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('zip ファイルではありません');
+  const count = le16(tail, eocd + 10), cdSize = le32(tail, eocd + 12), cdOff = le32(tail, eocd + 16);
+  const cd = await readSlice(blob, cdOff, cdOff + cdSize);
+  const out = [];
+  let p = 0;
+  for (let i = 0; i < count && p + 46 <= cd.length; i++) {
+    if (le32(cd, p) !== 0x02014b50) break;
+    const method = le16(cd, p + 10), csize = le32(cd, p + 20), usize = le32(cd, p + 24);
+    const nlen = le16(cd, p + 28), xlen = le16(cd, p + 30), clen = le16(cd, p + 32), loff = le32(cd, p + 42);
+    const name = utf8.decode(cd.subarray(p + 46, p + 46 + nlen));
+    p += 46 + nlen + xlen + clen;
+    if (name.endsWith('/')) continue;
+    const lh = await readSlice(blob, loff, loff + 30);
+    if (lh.length < 30 || le32(lh, 0) !== 0x04034b50) continue;
+    out.push({ name, method, csize, usize, start: loff + 30 + le16(lh, 26) + le16(lh, 28) });
+  }
+  return out;
+}
+
+export async function zipEntryBlob(blob, e, type = '') {
+  const raw = blob.slice(e.start, e.start + e.csize);
+  if (e.method === 0) return new Blob([raw], { type });
+  if (e.method === 8) {
+    const ab = await new Response(raw.stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer();
+    return new Blob([ab], { type });
+  }
+  throw new Error('対応していない圧縮の形です（' + e.method + '）');
+}
+
+// images.json：{ version, items: [{ file, audio?, start, end?, caption? }] }
+export function parseImageManifest(text) {
+  const j = JSON.parse(text);
+  const items = Array.isArray(j) ? j : (j && j.items) || [];
+  return items
+    .filter(x => x && typeof x.file === 'string' && x.file)
+    .map(x => ({
+      file: x.file,
+      audio: typeof x.audio === 'string' ? x.audio : '',
+      s: Math.max(0, Number(x.start) || 0),
+      e: x.end == null || !isFinite(Number(x.end)) ? null : Number(x.end),
+      caption: typeof x.caption === 'string' ? x.caption.trim() : '',
+    }))
+    .sort((a, b) => a.s - b.s);
+}
+
+// t 秒に出す画像（list は同じ音声ファイルの分・開始の順）
+export function imageAt(list, t) {
+  if (!list || !list.length) return null;
+  let idx = -1;
+  for (let i = 0; i < list.length; i++) { if (list[i].s <= t + 0.05) idx = i; else break; }
+  if (idx < 0) return null;
+  const x = list[idx];
+  return x.e == null || t < x.e ? x : null;
+}
