@@ -3,7 +3,7 @@ import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta,
   isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt } from './parse.js';
 import * as db from './db.js';
 
-const VERSION = '0.3';
+const VERSION = '0.3.1';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -291,18 +291,64 @@ async function readImagePack(zipFile, audioNames) {
   }
   return { zipFile, items };
 }
+// 画像として開けるか（createImageBitmap、使えなければ Image）
+function imageDecodes(blob) {
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    let done = false;
+    const fin = (ok) => { if (done) return; done = true; URL.revokeObjectURL(url); resolve(ok); };
+    img.onload = () => fin(img.naturalWidth > 0);
+    img.onerror = () => fin(false);
+    setTimeout(() => fin(false), 10000);
+    img.src = url;
+  });
+}
+async function canDecode(blob) {
+  if (typeof createImageBitmap === 'function') {
+    try { const bm = await createImageBitmap(blob); if (bm && bm.close) bm.close(); return true; } catch { }
+  }
+  return imageDecodes(blob);
+}
+// zip の中の写真を1枚、中身を読み切ってから確かめて返す（v0.3.1：ファイルの slice をそのまま保存しない）
+async function readImageEntry(zipFile, entry) {
+  const raw = await zipEntryBlob(zipFile, entry);
+  const buf = await raw.arrayBuffer();
+  if (!buf.byteLength) throw new Error('中身が空です');
+  if (entry.method === 0 && (buf.byteLength !== entry.csize || buf.byteLength !== entry.usize)) throw new Error('大きさが合いません');
+  if (entry.method === 8 && buf.byteLength !== entry.usize) throw new Error('大きさが合いません');
+  const blob = new Blob([buf], { type: mimeOf(entry.name) });
+  if (!(await canDecode(blob))) throw new Error('画像として開けません');
+  return blob;
+}
+// 戻り値 { images, failed }。読めなかった写真は1回だけ読み直し、だめなら外す
 async function saveImagePack(bookId, pack, saved) {
   const out = [];
+  let failed = 0;
   const tag = Date.now().toString(36);
   for (const [k, x] of pack.items.entries()) {
-    const blob = await zipEntryBlob(pack.zipFile, x.entry, mimeOf(x.entry.name));
+    let blob = null;
+    for (let attempt = 0; attempt < 2 && !blob; attempt++) {
+      try { blob = await readImageEntry(pack.zipFile, x.entry); } catch { blob = null; }
+    }
+    if (!blob) { failed++; continue; }
     const blobId = `${bookId}.img${tag}_${k}`;
     await db.putBlob(blobId, blob);
     saved.push(blobId);
     out.push({ blobId, file: x.fi, s: x.s, e: x.e, caption: x.caption });
   }
   out.sort((a, b) => a.file - b.file || a.s - b.s);
-  return out;
+  return { images: out, failed };
+}
+function imageResultMsg(n, failed) {
+  if (!failed) return `写真 ${n}枚を取り込みました`;
+  if (!n) return `写真は読めませんでした（${failed}枚）。もう一度「字幕・写真を追加」で選び直してください`;
+  return `写真 ${n}枚を取り込みました（${failed}枚は読めませんでした。もう一度「字幕・写真を追加」で選び直してください）`;
+}
+// 保存した音声・表紙を読み戻して大きさを確かめる
+async function checkSaved(blobId, size) {
+  const back = await db.getBlob(blobId).catch(() => null);
+  if (!back || back.size !== size) throw new Error('ファイルを読めませんでした。OneDrive でファイルを iPad にダウンロードしてから選び直してください');
 }
 function findPack(names, packs, allowSingle) {
   return packs.find(z => names.includes(imagePackBase(z.name))) || (allowSingle && packs.length === 1 ? packs[0] : null);
@@ -332,11 +378,14 @@ async function addExtrasToBook(book, files) {
       showBusy('写真を取り込んでいます…');
       const pack = await readImagePack(z, book.files.map(f => f.name));
       if (!pack.items.length) throw new Error('この本の音声に合う写真がありません');
+      const res = await saveImagePack(book.id, pack, saved);
+      if (!res.images.length) throw new Error(`${res.failed}枚とも読めませんでした。もう一度選び直してください`);
       const old = (book.images || []).map(x => x.blobId);
-      book.images = await saveImagePack(book.id, pack, saved);
+      book.images = res.images;
       await db.putBook(book);
       await db.deleteBlobs(old).catch(() => { });
-      msgs.push(`写真 ${book.images.length}枚`);
+      badNotified = null;
+      msgs.push(imageResultMsg(res.images.length, res.failed));
     } catch (e) {
       await db.deleteBlobs(saved).catch(() => { });
       msgs.push(`写真は取り込めませんでした（${e && e.message || e}）`);
@@ -488,6 +537,7 @@ function buildChapters(files, metas) {
 async function doImport(plans, metas) {
   try { await navigator.storage?.persist?.(); } catch { }
   let made = 0;
+  const imgMsgs = [];
   for (const [pi, p] of plans.entries()) {
     const id = uid();
     const saved = [];
@@ -500,6 +550,7 @@ async function doImport(plans, metas) {
         const blobId = `${id}.${j}`;
         await db.putBlob(blobId, blob);
         saved.push(blobId);
+        await checkSaved(blobId, f.size);
         let dur = m.duration || 0;
         if (!dur) dur = await measureDuration(blob);
         const entry = { blobId, name: f.name, size: f.size, type: blob.type, duration: dur };
@@ -511,7 +562,11 @@ async function doImport(plans, metas) {
       }
       let coverId = null;
       const coverBlob = p.coverFile ? new Blob([p.coverFile], { type: mimeOf(p.coverFile.name) }) : p.embedded;
-      if (coverBlob) { coverId = `${id}.cover`; await db.putBlob(coverId, coverBlob); saved.push(coverId); }
+      if (coverBlob) {
+        coverId = `${id}.cover`;
+        await db.putBlob(coverId, coverBlob); saved.push(coverId);
+        await checkSaved(coverId, coverBlob.size);
+      }
       const book = {
         id, title: p.title.trim(), author: p.author || '', addedAt: Date.now(), finished: false,
         files, coverId,
@@ -520,7 +575,9 @@ async function doImport(plans, metas) {
       };
       if (p.pack && p.pack.items.length) {
         showBusy(`取り込み中 ${pi + 1}/${plans.length}：${p.title}（写真）`, 1);
-        book.images = await saveImagePack(id, p.pack, saved);
+        const res = await saveImagePack(id, p.pack, saved);
+        if (res.images.length) book.images = res.images;
+        imgMsgs.push((plans.length > 1 ? `${p.title}：` : '') + imageResultMsg(res.images.length, res.failed));
       }
       await db.putBook(book);
       made++;
@@ -535,7 +592,10 @@ async function doImport(plans, metas) {
   }
   hideBusy();
   await refreshLibrary();
-  if (made) toast(made > 1 ? `${made}冊を取り込みました` : '取り込みました');
+  if (made) {
+    const base = made > 1 ? `${made}冊を取り込みました` : '取り込みました';
+    toast(imgMsgs.length ? `${base}・${imgMsgs.join('・')}` : base, imgMsgs.length ? 7000 : 3200);
+  }
 }
 
 // ---------------- 再生 ----------------
@@ -977,7 +1037,7 @@ let slideShown = null;
 async function imageUrl(id) {
   if (imgUrls.has(id)) return imgUrls.get(id);
   const b = await db.getBlob(id).catch(() => null);
-  if (!b) return null;
+  if (!b || !b.size) return null;
   const u = URL.createObjectURL(b);
   imgUrls.set(id, u);
   for (const [k, v] of imgUrls) {
@@ -986,11 +1046,27 @@ async function imageUrl(id) {
   }
   return u;
 }
+const badImages = new Set();   // 表示できなかった写真（この再生中は出さない）
+let badNotified = null;         // 案内を出した本の id
 function currentImage() {
   const b = P.book;
   if (!imgsOn || !hasImages(b)) return null;
-  return imageAt(b.images.filter(x => x.file === P.fi), curTime());
+  return imageAt(b.images.filter(x => x.file === P.fi && !badImages.has(x.blobId)), curTime());
 }
+function markBadImage(id) {
+  badImages.add(id);
+  $('slide').hidden = true;
+  $('slideImg').removeAttribute('src');
+  if (P.book && badNotified !== P.book.id) {
+    badNotified = P.book.id;
+    toast('写真を表示できませんでした。本の「…」→「字幕・写真を追加」で .images.zip を選び直してください', 7000);
+  }
+  slideShown = undefined;
+  renderSlide();
+}
+$('slideImg').addEventListener('error', () => {
+  if (slideShown && $('slideImg').getAttribute('src')) markBadImage(slideShown);
+});
 function renderSlide() {
   const x = currentImage();
   const id = x ? x.blobId : null;
@@ -1000,15 +1076,15 @@ function renderSlide() {
   if (!x) { box.hidden = true; $('slideImg').removeAttribute('src'); return; }
   imageUrl(id).then(u => {
     if (slideShown !== id) return;
-    if (!u) { box.hidden = true; return; }
+    if (!u) { markBadImage(id); return; }
     const img = $('slideImg');
     img.classList.remove('kb');
+    img.onload = () => { if (slideShown === id) box.hidden = false; };   // 読めてから出す（「？」を出さない）
     img.src = u;
     void img.offsetWidth;
     img.classList.add('kb');
     $('slideCap').textContent = x.caption || '';
     $('slideCap').hidden = !x.caption;
-    box.hidden = false;
   });
 }
 function renderImgsButton() {
@@ -1119,6 +1195,6 @@ async function start() {
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; } };
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
 
 start();
