@@ -1,7 +1,12 @@
-// ききウサ：本の中身（字幕・章・題名）から言葉を拾い、ウィキペディアの記事の写真を選ぶ（画面に依存しない）
-// 写真は日本語版ウィキペディアの記事の代表画像（自由に使えるライセンスのものだけ）。
+// ききウサ：本の中身（字幕・章・題名）から言葉を拾い、写真を選ぶ（画面に依存しない）
+// 集め先（v0.8）：日本語版ウィキペディアの記事の代表画像と記事の中の写真、ウィキメディア・コモンズ、
+// Openverse（Flickr などの CC の写真）、Pexels・Pixabay（鍵を設定したときだけ）。
 
 const API = 'https://ja.wikipedia.org/w/api.php';
+const COMMONS = 'https://commons.wikimedia.org/w/api.php';
+const SPARQL = 'https://query.wikidata.org/sparql';
+const OPENVERSE = 'https://api.openverse.org/v1/images/';
+const enc = encodeURIComponent;
 // ウィキペディアの決まり：どのアプリからの問い合わせか分かるようにする。写真の幅は決まった幅（1280）だけを使う
 const HDR = { headers: { 'Api-User-Agent': 'KikiUsa (https://arkwtkk.github.io/kikiusa/)' } };
 export const THUMB = 1280;
@@ -114,8 +119,13 @@ export function goodImage(info) {
   return true;
 }
 
-const pageInfo = (p) => p && !p.missing && !(p.pageprops && 'disambiguation' in p.pageprops) && p.thumbnail
-  ? { title: p.title, file: p.pageimage, thumb: p.thumbnail.source, w: p.thumbnail.width, h: p.thumbnail.height }
+const pageInfo = (p) => p && !p.missing && !(p.pageprops && 'disambiguation' in p.pageprops)
+  ? {
+    title: p.title, file: p.thumbnail ? p.pageimage : null, thumb: p.thumbnail ? p.thumbnail.source : null,
+    w: p.thumbnail ? p.thumbnail.width : 0, h: p.thumbnail ? p.thumbnail.height : 0,
+    en: (p.langlinks && p.langlinks[0] && (p.langlinks[0].title || p.langlinks[0]['*'])) || null,
+    qid: (p.pageprops && p.pageprops.wikibase_item) || null,
+  }
   : null;
 
 // 言葉（記事名）→ 記事の代表画像。50件ずつまとめて問い合わせる
@@ -123,7 +133,7 @@ export async function wikiLookup(titles, fetchFn = fetch, size = THUMB) {
   const out = new Map();
   for (let i = 0; i < titles.length; i += 50) {
     const part = titles.slice(i, i + 50);
-    const u = `${API}?action=query&format=json&formatversion=2&origin=*&redirects=1&prop=pageimages|pageprops&piprop=thumbnail|name&pithumbsize=${size}&ppprop=disambiguation&titles=${encodeURIComponent(part.join('|'))}`;
+    const u = `${API}?action=query&format=json&formatversion=2&origin=*&redirects=1&prop=pageimages|pageprops|langlinks&piprop=thumbnail|name&pithumbsize=${size}&pilimit=50&ppprop=disambiguation|wikibase_item&lllang=en&lllimit=max&titles=${encodeURIComponent(part.join('|'))}`;
     const j = await fetchFn(u, HDR).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
     const q = j.query || {};
     const final = new Map();   // 元の言葉 → 最後にたどり着いた記事名
@@ -175,17 +185,116 @@ export async function wikiCredits(files, fetchFn = fetch) {
   return out;
 }
 
-export function creditText(term, cr) {
-  const who = cr && cr.artist ? cr.artist : '';
+export function creditText(term, cr, site = 'ウィキペディア') {
+  let who = cr && cr.artist ? String(cr.artist) : '';
+  if (who.length > 40) who = who.slice(0, 39) + '…';
   const lic = cr && cr.license ? cr.license : '';
   const src = [who, lic].filter(Boolean).join('／');
-  return `${term}　写真：${src ? src + '・' : ''}ウィキペディア`;
+  return `${term}　写真：${src ? src + '・' : ''}${site}`;
 }
 
-// 本に合う写真を選ぶ（まだダウンロードしない）。返すのは [{term, file(音声の番号)|null, t(秒)|null, thumb, fileName}]
-export async function planAutoImages(book, { fetchFn = fetch, max = 30, ban = [] } = {}) {
+// ---------------- 集め先（v0.8） ----------------
+export const normFile = (f) => String(f || '').replace(/^(File|ファイル|Image|画像):/i, '').replace(/_/g, ' ').trim();
+
+async function getJson(fetchFn, url, opt) {
+  const r = await fetchFn(url, opt);
+  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+  return r.json();
+}
+
+// imageinfo の付いたファイルのページ → 写真の候補
+function fileCand(p, site, src) {
+  const ii = p && p.imageinfo && p.imageinfo[0];
+  if (!ii) return null;
+  const file = normFile(p.title);
+  const c = { file, thumb: ii.thumburl || ii.url, w: ii.width || 0, h: ii.height || 0, fileName: file, site, src, key: 'f:' + file };
+  if (ii.mime && !/^image\/(jpeg|png|webp)$/.test(ii.mime)) return null;
+  return goodImage(c) ? c : null;
+}
+
+// 記事の中の写真（代表画像のほかに、記事に載っている写真）
+export async function wikiArticleImages(title, fetchFn = fetch) {
+  const u = `${API}?action=query&format=json&formatversion=2&origin=*&titles=${enc(title)}&generator=images&gimlimit=50&prop=imageinfo&iiprop=url|size|mime&iiurlwidth=${THUMB}`;
+  const j = await getJson(fetchFn, u, HDR);
+  return ((j.query || {}).pages || []).map(p => fileCand(p, 'ウィキペディア', 'wiki')).filter(Boolean);
+}
+
+// ウィキメディア・コモンズの検索
+export async function commonsSearch(q, fetchFn = fetch, limit = 12) {
+  const u = `${COMMONS}?action=query&format=json&formatversion=2&origin=*&generator=search&gsrnamespace=6&gsrlimit=${limit}&gsrsearch=${enc(q + ' filetype:bitmap')}&prop=imageinfo&iiprop=url|size|mime&iiurlwidth=${THUMB}`;
+  const j = await getJson(fetchFn, u, HDR);
+  const pages = ((j.query || {}).pages || []).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
+  return pages.map(p => fileCand(p, 'ウィキメディア・コモンズ', 'commons')).filter(Boolean);
+}
+
+const OV_SITE = { flickr: 'Flickr', wikimedia: 'ウィキメディア', nappy: 'nappy', rawpixel: 'rawpixel', stocksnap: 'StockSnap' };
+export function ovLicense(r) {
+  const l = String(r.license || '').toLowerCase();
+  if (l === 'cc0') return 'CC0';
+  if (l === 'pdm') return 'パブリックドメイン';
+  return l ? `CC ${l.toUpperCase()}${r.license_version ? ' ' + r.license_version : ''}` : '';
+}
+// Openverse（Flickr などのクリエイティブ・コモンズの写真）。英語の言葉で探す
+export async function openverseSearch(q, fetchFn = fetch, n = 10) {
+  const u = `${OPENVERSE}?q=${enc(q)}&page_size=${n}&mature=false`;
+  const j = await getJson(fetchFn, u);
+  return (j.results || []).filter(r => r.url && !(r.width && r.width < 400) && !(r.height && r.height < 250)
+    && !/\.(svg|gif|tiff?)(\?|$)/i.test(r.url)).map(r => ({
+    thumb: r.url, alt: `${OPENVERSE}${r.id}/thumb/?full_size=true`, w: r.width || 0, h: r.height || 0,
+    key: 'ov:' + r.id, src: 'openverse', site: `${OV_SITE[r.source] || r.source || 'Openverse'}（Openverse）`,
+    credit: { artist: r.creator || '', license: ovLicense(r) },
+  }));
+}
+
+// Pexels（鍵が要る）
+export async function pexelsSearch(q, key, fetchFn = fetch, n = 8, locale = '') {
+  const u = `https://api.pexels.com/v1/search?query=${enc(q)}&per_page=${n}&orientation=landscape${locale ? '&locale=' + locale : ''}`;
+  const j = await getJson(fetchFn, u, { headers: { Authorization: key } });
+  return (j.photos || []).filter(p => p.src && p.src.large2x).map(p => ({
+    thumb: p.src.large2x, w: p.width || 0, h: p.height || 0, key: 'px:' + p.id, src: 'pexels', site: 'Pexels',
+    credit: { artist: p.photographer || '' },
+  }));
+}
+
+// Pixabay（鍵が要る）
+export async function pixabaySearch(q, key, fetchFn = fetch, n = 8, lang = '') {
+  const u = `https://pixabay.com/api/?key=${enc(key)}&q=${enc(String(q).slice(0, 100))}&image_type=photo&safesearch=true&per_page=${Math.max(3, n)}${lang ? '&lang=' + lang : ''}`;
+  const j = await getJson(fetchFn, u);
+  return (j.hits || []).filter(h => h.largeImageURL).map(h => ({
+    thumb: h.largeImageURL, w: h.imageWidth || 0, h: h.imageHeight || 0, key: 'pb:' + h.id, src: 'pixabay', site: 'Pixabay',
+    credit: { artist: h.user || '' },
+  }));
+}
+
+// 鍵が使えるか（設定で貼ったとき）
+export async function testKey(kind, key, fetchFn = fetch) {
+  try {
+    if (kind === 'pexels') await pexelsSearch('nature', key, fetchFn, 1);
+    else await pixabaySearch('nature', key, fetchFn, 3);
+    return true;
+  } catch (e) { if (e.status === 401 || e.status === 403 || e.status === 400) return false; throw e; }
+}
+
+// 人の名前か（ウィキデータで「人間」のもの）。人には似た別人の写真が出る集め先を使わない
+export async function personSet(qids, fetchFn = fetch) {
+  const out = new Set();
+  const ids = [...new Set(qids.filter(q => /^Q\d+$/.test(q || '')))];
+  for (let i = 0; i < ids.length; i += 200) {
+    const part = ids.slice(i, i + 200);
+    const q = `SELECT ?item WHERE { VALUES ?item { ${part.map(x => 'wd:' + x).join(' ')} } ?item wdt:P31 wd:Q5 }`;
+    const j = await getJson(fetchFn, `${SPARQL}?format=json&query=${enc(q)}`, { headers: { Accept: 'application/sparql-results+json', ...HDR.headers } });
+    for (const b of ((j.results || {}).bindings || [])) out.add(String(b.item.value).split('/').pop());
+  }
+  return out;
+}
+
+// 本に合う写真を選ぶ（まだダウンロードしない）。
+// 返すのは [{term, label, file(音声の番号)|null, t(秒)|null, thumb, alt?, fileName?, credit?, site, src, key}]
+// 区切りごとに perWin 枚まで：1) 記事の代表画像 2) その言葉の、ほかの集め先の写真を順番に（記事の中の写真・Pexels・Pixabay・コモンズ・Openverse）
+export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin = 3, ban = [], keys = {}, ovMax = 8, interval = 60 } = {}) {
   const total = (book.files || []).reduce((s, f) => s + (f.duration || 0), 0) || 60;
-  const W = Math.min(1200, Math.max(60, total / Math.ceil(max / 2)));   // 区切りごとに2枚まで
+  // 区切りの長さ：本の長さ÷（最大枚数÷区切りの枚数）。ただし切り替えの間隔×区切りの枚数より短くしない（出せない写真を集めない）
+  const W = Math.min(1200, Math.max(60, perWin * interval, total / Math.ceil(max / perWin)));
   const wins = rankWindows(buildWindows(book, W));
   const banned = new Set(ban);
   const bterms = bookTerms(book);
@@ -195,34 +304,124 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 30, ban = []
   for (const w of wins) w.terms.forEach(push);
   bterms.forEach(push);
   const lookup = await wikiLookup(cand.slice(0, 450), fetchFn);
-  const usedFile = new Set();
-  const usedTerm = new Set();
+  for (const [k, v] of [...lookup]) if (banned.has(v.title)) lookup.delete(k);
+  const notes = { bad: {}, errors: 0 };
+  // 人の名前か（失敗したら、すべて人として扱い、別人の写真が出る集め先は使わない）
+  let persons = null;
+  try { persons = await personSet([...lookup.values()].map(v => v.qid), fetchFn); } catch { persons = null; }
+  const isPerson = (info) => !persons || persons.has(info.qid);
+
+  const usedKey = new Set();
+  const usedLead = new Set();
   const out = [];
-  const take = (term, info, file, t) => {
-    if (!goodImage(info) || usedFile.has(info.file) || usedTerm.has(info.title)) return false;
-    usedFile.add(info.file); usedTerm.add(info.title);
-    out.push({ term: info.title, file, t, thumb: info.thumb, fileName: info.file });
+  let ovLeft = ovMax;
+  const add = (c, info, label, file, t) => {
+    if (!c || usedKey.has(c.key) || banned.has(c.key)) return false;
+    usedKey.add(c.key);
+    if (c.fileName) usedKey.add('f:' + normFile(c.fileName));
+    out.push({ term: info.title, label, file, t, thumb: c.thumb, alt: c.alt, fileName: c.fileName, credit: c.credit, site: c.site, src: c.src, key: c.key });
     return true;
   };
+  const takeLead = (info, file, t) => {
+    if (!goodImage(info) || usedLead.has(info.title)) return false;
+    const c = { thumb: info.thumb, fileName: info.file, site: 'ウィキペディア', src: 'wiki', key: 'f:' + normFile(info.file) };
+    if (!add(c, info, info.title, file, t)) return false;
+    usedLead.add(info.title);
+    return true;
+  };
+  // 言葉ごとの、ほかの集め先の写真（はじめて使うときにまとめて問い合わせ、集め先を順番に混ぜる）
+  const ext = new Map();
+  const extFor = async (term) => {
+    if (ext.has(term)) return ext.get(term);
+    const info = lookup.get(term);
+    const lists = [];
+    const tryList = async (name, fn) => {
+      try { lists.push(await fn()); }
+      catch (e) {
+        if ((name === 'pexels' || name === 'pixabay') && e && (e.status === 401 || e.status === 403 || e.status === 400)) notes.bad[name] = true;
+        if (name === 'openverse' && e && e.status === 429) ovLeft = 0;
+        notes.errors++;
+      }
+    };
+    const person = isPerson(info);
+    // 英語の名前があれば写真サイトは英語で探す（なければ日本語で）
+    const q = info.moved ? term : (info.en || info.title);
+    const jaQ = info.moved || !info.en;
+    // 混ぜる順：写真サイト（鍵があるとき）→ 記事の中の写真 → コモンズ → Openverse
+    const jobs = [];
+    if (!person) {
+      if (keys.pexels && !notes.bad.pexels) jobs.push(['pexels', () => pexelsSearch(q, keys.pexels, fetchFn, 8, jaQ ? 'ja-JP' : '')]);
+      if (keys.pixabay && !notes.bad.pixabay) jobs.push(['pixabay', () => pixabaySearch(q, keys.pixabay, fetchFn, 8, jaQ ? 'ja' : '')]);
+    }
+    if (!info.moved) jobs.push(['wiki', () => wikiArticleImages(info.title, fetchFn)]);
+    if (!person) {
+      if (!info.moved) jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn)]);
+      if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn)]); }
+    }
+    for (const [name, fn] of jobs) await tryList(name, fn);
+    // 集め先を順番に1枚ずつ混ぜる
+    const merged = [];
+    for (let k = 0; lists.some(l => l.length > k); k++) for (const l of lists) if (l[k]) merged.push(l[k]);
+    const st = { list: merged, i: 0 };
+    ext.set(term, st);
+    return st;
+  };
+  const nextExt = async (term) => {
+    const st = await extFor(term);
+    while (st.i < st.list.length) {
+      const c = st.list[st.i++];
+      if (!usedKey.has(c.key) && !banned.has(c.key) && !(c.fileName && usedKey.has('f:' + normFile(c.fileName)))) return c;
+    }
+    return null;
+  };
+
+  // ひとつの区切り（または本全体）を埋める
+  const fill = async (terms, file, tAt, limit) => {
+    const infos = terms.map(t => [t, lookup.get(t)]).filter(([, v]) => v);
+    const order = [...infos.filter(([, v]) => !v.moved), ...infos.filter(([, v]) => v.moved)];
+    let got = 0;
+    // 1) 記事の代表画像（別の意味に転送された言葉は使わない）。1枠はほかの集め先のために空けておく
+    const leadMax = limit > 1 ? limit - 1 : limit;
+    for (const [, info] of order) {
+      if (got >= leadMax || out.length >= max) break;
+      if (!info.moved && takeLead(info, file, tAt(got))) got++;
+    }
+    if (got >= limit || out.length >= max) return got;
+    // 2) 上位の言葉から、ほかの集め先の写真
+    const top = order.slice(0, 3);
+    let progress = true;
+    while (got < limit && out.length < max && progress) {
+      progress = false;
+      for (const [term, info] of top) {
+        if (got >= limit || out.length >= max) break;
+        const c = await nextExt(term);
+        if (c && add(c, info, c.src === 'wiki' ? `${info.title}（記事の写真）` : (info.moved ? term : info.title), file, tAt(got))) { got++; progress = true; }
+      }
+    }
+    // 3) ほかの集め先がなければ、残りの枠も代表画像で
+    for (const [, info] of order) {
+      if (got >= limit || out.length >= max) return got;
+      if (!info.moved && takeLead(info, file, tAt(got))) got++;
+    }
+    // 4) それでも空いていれば、転送された記事の代表画像（前の版と同じ後回し）
+    for (const [, info] of order) {
+      if (got >= limit || out.length >= max) return got;
+      if (info.moved && takeLead(info, file, tAt(got))) got++;
+    }
+    return got;
+  };
+
   for (const w of wins) {
     if (out.length >= max) break;
-    // 点数の順に、別の意味に転送されていない記事を先に。区切りごとに2枚まで（2枚目は区切りの半ば）
-    const order = [...w.terms.filter(t => lookup.get(t) && !lookup.get(t).moved), ...w.terms.filter(t => lookup.get(t) && lookup.get(t).moved)];
-    let got = 0;
-    for (const term of order) {
-      if (got >= 2 || out.length >= max) break;
-      if (take(term, lookup.get(term), w.file, got ? w.s + (w.e - w.s) / 2 : w.s)) got++;
-    }
+    await fill(w.terms, w.file, (k) => w.s + (w.e - w.s) * k / perWin, perWin);
   }
   // 字幕のない本などで少ないときは、本全体の言葉で足す（時刻なし＝合間に出す）。
   // 題名や作者名での検索はしない（同じ名前の別人の写真が出るため）
   if (out.length < 4) {
-    for (const term of bterms) {
-      if (out.length >= 8) break;
-      const info = lookup.get(term);
-      if (info && !info.moved) take(term, info, null, null);
-    }
+    const nonMoved = bterms.filter(t => lookup.get(t) && !lookup.get(t).moved);
+    await fill(nonMoved, null, () => null, Math.min(max, 8) - out.length);
   }
+  out.notes = notes;
   return out;
 }
 
@@ -236,10 +435,14 @@ export function autoSchedule(book, pool, interval = 60) {
   const lastShown = new Map();   // blobId → 何番目に出したか
   let step = 0, prev = null;
   // まだ出していない「合間の写真」を先に、その後は出した順の古いものから
+  let curFile = 0, curS = 0;
   const pickFiller = () => {
     const shownIds = [...lastShown.keys()];
     const fresh = fillers.find(x => !lastShown.has(x.blobId) && x.blobId !== prev);
     if (fresh) return fresh;
+    // まだ出していない「その場の写真」のうち、もう過ぎた場所のもの（新しい順）を合間に
+    const stale = anchored.filter(x => !lastShown.has(x.blobId) && x.blobId !== prev && (x.file < curFile || (x.file === curFile && x.t < curS)));
+    if (stale.length) return stale[stale.length - 1];
     let best = null, bestAt = Infinity;
     for (const id of shownIds) {
       if (id === prev) continue;
@@ -251,16 +454,13 @@ export function autoSchedule(book, pool, interval = 60) {
   (book.files || []).forEach((f, fi) => {
     const dur = f.duration || 0;
     const mine = anchored.filter(x => x.file === fi);
-    let ai = 0;
     const n = Math.max(1, Math.ceil(dur / interval));
     for (let k = 0; k < n; k++) {
       const s = k * interval, e = (k + 1) * interval;
-      let x = null;
-      // この区切りまでに来た「その場の写真」のうち、まだ出していないもの
-      while (ai < mine.length && mine[ai].t < e) {
-        if (!lastShown.has(mine[ai].blobId)) { x = mine[ai]; ai++; break; }
-        ai++;
-      }
+      curFile = fi; curS = s;
+      // 今の場所（s〜e）の写真で、まだ出していないもの。なければ1つ前の間隔のもの（遅れて出さない）
+      let x = mine.find(y => !lastShown.has(y.blobId) && y.t >= s && y.t < e && y.blobId !== prev)
+        || mine.find(y => !lastShown.has(y.blobId) && y.t >= s - interval && y.t < s && y.blobId !== prev) || null;
       if (!x) x = pickFiller();
       if (!x) continue;
       if (x.blobId === prev && pool.length > 1) continue;

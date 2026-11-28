@@ -251,3 +251,12 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
 .shelf-tabs { display: flex; gap: 10px; margin: 0 0 16px; flex-wrap: wrap; }
 .shelf-tabs .pill { min-width: 0; padding: 9px 20px; }
 .shelf-none { text-align: center; margin: 40px auto; max-width: 520px; line-height: 1.7; }
+
+/* v0.8 写真サイトの鍵 */
+.key-row { margin: 10px 0 14px; }
+.key-name { display: flex; gap: 12px; align-items: baseline; margin-bottom: 6px; }
+.key-name a { font-size: 14px; color: var(--accent); }
+.key-line { display: flex; gap: 8px; align-items: center; }
+.key-input { flex: 1; min-width: 0; font: inherit; font-size: 15px; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,.18); background: var(--card); color: inherit; }
+.key-line .pill { min-width: 0; padding: 8px 14px; }
+.key-status { font-size: 13px; margin-top: 4px; }

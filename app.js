@@ -2,9 +2,9 @@
 import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta, parseSubtitles, cueAt,
   isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt, normDate } from './parse.js';
 import * as db from './db.js';
-import { planAutoImages, wikiCredits, creditText, autoSchedule } from './auto.js';
+import { planAutoImages, wikiCredits, creditText, autoSchedule, testKey } from './auto.js';
 
-const VERSION = '0.7';
+const VERSION = '0.8';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -217,7 +217,7 @@ function bookMenu(b) {
     body.append(el('h2', null, b.title));
     const info = el('p', 'muted', `${b.chapters.length}章・${jaDur(b.duration)}・${size(b.files.reduce((s, f) => s + (f.size || 0), 0))}`
       + (b.expireAt ? `・${md(b.expireAt)} に自動で消えます` : '')
-      + (hasImages(b) ? `・写真 ${b.images.length}枚` : hasAutoImages(b) ? `・写真 ${b.auto.pool.length}枚（ウィキペディア）` : ''));
+      + (hasImages(b) ? `・写真 ${b.images.length}枚` : hasAutoImages(b) ? `・写真 ${b.auto.pool.length}枚（自動で集めた写真）` : ''));
     const opts = el('div', 'opts');
     const add = (label, fn, cls) => { const x = el('button', cls, label); x.onclick = fn; opts.append(x); };
     add('名前を変える', () => renameBook(b));
@@ -254,7 +254,7 @@ function bookMenu(b) {
       toast('写真を外しました');
     });
     if (!hasImages(b)) {
-      add(hasAutoImages(b) ? '写真を集め直す（ウィキペディア）' : '写真を自動で集める（ウィキペディア）', () => {
+      add(hasAutoImages(b) ? '写真を集め直す' : '写真を自動で集める', () => {
         closeSheet();
         if (b.auto) { delete b.auto.off; delete b.auto.none; }
         queueAutoImages(b, { manual: true });
@@ -412,7 +412,16 @@ function imageList(book) {
   return items;
 }
 
-// ---------------- 写真を自動で集める（ウィキペディア） ----------------
+// ---------------- 写真を自動で集める（ウィキペディア・コモンズ・Openverse・Pexels・Pixabay） ----------------
+const AUTO_MAX = 40;
+const photoKey = (kind) => (localStorage.getItem('kk.key.' + kind) || '').trim();
+// 集め先ごとの数（知らせ用）
+const SRC_NAME = { wiki: 'ウィキペディア', commons: 'ウィキペディア', openverse: 'Openverse', pexels: 'Pexels', pixabay: 'Pixabay' };
+function srcSummary(pool) {
+  const m = new Map();
+  for (const x of pool) { const n = SRC_NAME[x.src || 'wiki'] || 'ウィキペディア'; m.set(n, (m.get(n) || 0) + 1); }
+  return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => m.size > 1 ? `${k} ${v}` : k).join('・');
+}
 const autoQueue = [];
 let autoBusy = false;
 function queueAutoImages(book, { manual = false } = {}) {
@@ -437,19 +446,20 @@ async function runAutoQueue() {
     }
   } finally { autoBusy = false; }
 }
-// 本の中身から言葉を拾い、ウィキペディアの写真を最大30枚ダウンロードして保存する
+// 本の中身から言葉を拾い、写真を最大40枚ダウンロードして保存する
 async function collectAutoImages(book, manual) {
   if (manual) toast(`「${book.title}」の写真を集めています…`, 4000);
   let plan;
   try {
-    plan = await planAutoImages(book, { ban: (book.auto && book.auto.ban) || [] });
+    plan = await planAutoImages(book, { max: AUTO_MAX, interval: slideSec, ban: (book.auto && book.auto.ban) || [], keys: { pexels: photoKey('pexels'), pixabay: photoKey('pixabay') } });
   } catch (e) {
     book.auto = { ...(book.auto || {}), failAt: Date.now() };
     await db.putBook(book).catch(() => { });
     if (manual) toast('写真を集められませんでした（ネットにつながっているか確かめてください）', 6000);
     return;
   }
-  const credits = await wikiCredits(plan.map(x => x.fileName)).catch(() => new Map());
+  const credits = await wikiCredits(plan.filter(x => x.fileName).map(x => x.fileName)).catch(() => new Map());
+  const notes = plan.notes || { bad: {} };
   const pool = [];
   const stamp = Date.now().toString(36);
   let i = 0;
@@ -459,9 +469,15 @@ async function collectAutoImages(book, manual) {
       const x = work.shift();
       const blobId = `${book.id}.w${stamp}${i++}`;
       try {
-        let r = await fetch(x.thumb);
-        if (r.status === 429) { await new Promise(ok => setTimeout(ok, 3000)); r = await fetch(x.thumb); }   // 混んでいたら1回だけ待って取り直す
-        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const get = async (url) => {
+          let r = await fetch(url);
+          if (r.status === 429) { await new Promise(ok => setTimeout(ok, 3000)); r = await fetch(url); }   // 混んでいたら1回だけ待って取り直す
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r;
+        };
+        let r;
+        try { r = await get(x.thumb); }
+        catch (e) { if (!x.alt) throw e; r = await get(x.alt); }   // Openverse：元のサイトから取れなければ Openverse 経由で
         const buf = await r.arrayBuffer();
         if (!buf.byteLength || buf.byteLength > 4e6) throw new Error('size');
         const type = r.headers.get('content-type') || 'image/jpeg';
@@ -470,11 +486,11 @@ async function collectAutoImages(book, manual) {
         if (!(await canDecode(blob))) throw new Error('decode');
         await db.putBlob(blobId, blob);
         await checkSaved(blobId, buf.byteLength);
-        pool.push({ blobId, term: x.term, file: x.file, t: x.t, caption: creditText(x.term, credits.get(x.fileName)), order: plan.indexOf(x) });
+        pool.push({ blobId, term: x.term, file: x.file, t: x.t, src: x.src || 'wiki', key: x.key, caption: creditText(x.label || x.term, x.fileName ? credits.get(x.fileName) : x.credit, x.site), order: plan.indexOf(x) });
       } catch { await db.deleteBlobs([blobId]).catch(() => { }); }
     }
   };
-  await Promise.all([one(), one()]);   // 2枚ずつ（ウィキペディアに負担をかけない）
+  await Promise.all([one(), one()]);   // 2枚ずつ（集め先に負担をかけない）
   pool.sort((a, b) => a.order - b.order);
   pool.forEach(x => delete x.order);
   // 本が消されていたら捨てる
@@ -488,7 +504,9 @@ async function collectAutoImages(book, manual) {
   schedCache.delete(still.id);
   if (P.book && P.book.id === still.id) { P.book = still; renderImgsButton(); }
   renderLibrary();
-  if (pool.length) toast(`「${still.title}」の写真を${pool.length}枚集めました（ウィキペディア）`, 5000);
+  const badKey = ['pexels', 'pixabay'].filter(k => notes.bad && notes.bad[k]).map(k => k === 'pexels' ? 'Pexels' : 'Pixabay');
+  if (badKey.length) toast(`${badKey.join('・')} の鍵が使えませんでした（設定で貼り直してください）。ほかの集め先の写真を集めました`, 7000);
+  else if (pool.length) toast(`「${still.title}」の写真を${pool.length}枚集めました（${srcSummary(pool)}）`, 5000);
   else if (manual) toast('この本に合う写真が見つかりませんでした', 5000);
 }
 
@@ -839,7 +857,7 @@ async function doImport(plans, metas) {
     const msgs = [...imgMsgs]; if (swept) msgs.push(swept);
     toast(msgs.length ? `${base}・${msgs.join('・')}` : base, msgs.length ? 7000 : 3200);
   }
-  // 写真のない本は、ウィキペディアから写真を集める（取り込みの知らせのあとで）
+  // 写真のない本は、写真を自動で集める（取り込みの知らせのあとで）
   setTimeout(() => { for (const id of madeBooks) queueAutoImages(books.find(b => b.id === id)); }, 1500);
 }
 
@@ -874,7 +892,7 @@ async function openBook(book) {
   P.fi = fi; P.pendingSeek = t;
   renderPlayer();
   sweepExpired();   // 前に開いていた本が期限切れなら、ここで消える
-  queueAutoImages(book);   // 写真のない本なら、ウィキペディアから集める
+  queueAutoImages(book);   // 写真のない本なら、自動で集める
   await loadFile(fi, t, false);
 }
 
@@ -1623,14 +1641,17 @@ $('viewerDel').onclick = async (e) => {
   const x = b.auto.pool.find(y => y.blobId === id);
   if (!x) return;
   b.auto.pool = b.auto.pool.filter(y => y.blobId !== id);
-  b.auto.ban = [...new Set([...(b.auto.ban || []), x.term])];
+  // 記事の代表画像なら言葉ごと、それ以外はその写真だけを、集め直しても使わない
+  const lead = (x.src || 'wiki') === 'wiki' && !/（記事の写真）/.test(x.caption || '');
+  const add = lead || !x.key ? [x.term] : [x.key];
+  b.auto.ban = [...new Set([...(b.auto.ban || []), ...add])];
   if (!b.auto.pool.length) b.auto = { none: true, ban: b.auto.ban };
   await db.putBook(b);
   await db.deleteBlobs([id]).catch(() => { });
   schedCache.delete(b.id);
   slideShown = undefined;
   renderImgsButton();
-  toast(`「${x.term}」の写真を外しました`);
+  toast(lead || !x.key ? `「${x.term}」の写真を外しました` : 'この写真を外しました');
 };
 
 function renderRate() { $('btnRate').textContent = `速さ ${rate % 1 ? rate : rate.toFixed(1)}×`; }
@@ -1738,7 +1759,7 @@ async function openSettings() {
     const ag = el('button', 'set-autoimg');
     const agSub = el('span', 'sub', '');
     const showAg = () => { const on = autoImgOn(); agSub.textContent = on ? 'オン' : 'オフ'; ag.classList.toggle('sel', on); };
-    ag.append(el('span', null, '本の中身からウィキペディアの写真を集める'), agSub);
+    ag.append(el('span', null, '本の中身から写真を自動で集める'), agSub);
     ag.onclick = () => { localStorage.setItem('kk.autoImg', autoImgOn() ? '0' : '1'); showAg(); };
     showAg();
     opts2.append(ag);
@@ -1755,7 +1776,35 @@ async function openSettings() {
       secRow.append(sb);
     }
     body.append(secRow);
-    body.append(el('p', 'muted', '字幕の文章・章の名前・本の名前から言葉を拾い、その言葉のウィキペディアの記事の写真を、聞いている場所に合わせて出します（本を取り込んだとき・開いたときに、最大30枚を集めます）。合わない写真は、写真を押して全画面にし「この写真を外す」で外せます。'));
+    body.append(el('p', 'muted', '字幕の文章・章の名前・本の名前から言葉を拾い、その言葉の写真を、聞いている場所に合わせて出します（本を取り込んだとき・開いたときに、最大40枚を集めます）。集め先は、ウィキペディア（記事の写真）・ウィキメディア・コモンズ・Openverse（Flickr などの写真）と、鍵を貼ったときは Pexels・Pixabay です。人の名前では、似た別人の写真を避けるため、ウィキペディアの写真だけを使います。合わない写真は、写真を押して全画面にし「この写真を外す」で外せます。'));
+    // 写真サイトの鍵（Pexels・Pixabay）
+    body.append(el('h3', 'set-h', '写真サイトの鍵（無料・なくても使えます）'));
+    body.append(el('p', 'muted', 'Pexels・Pixabay は、雰囲気の合うきれいな写真が多いサイトです。それぞれのサイトでメールアドレスを登録すると「API キー」（鍵）がもらえます。下に貼ると、その写真も集めます。鍵はこの iPad の中にだけ保存します。貼ったあと、前に集めた本は、本の「…」→「写真を集め直す」で新しい写真が入ります。'));
+    for (const [kind, name, url] of [['pexels', 'Pexels', 'https://www.pexels.com/api/'], ['pixabay', 'Pixabay', 'https://pixabay.com/api/docs/']]) {
+      const row = el('div', 'key-row key-' + kind);
+      const lab = el('div', 'key-name');
+      const a = el('a', null, name + ' の鍵をもらう'); a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      lab.append(el('b', null, name), a);
+      const inp = el('input', 'key-input'); inp.type = 'text'; inp.autocomplete = 'off'; inp.autocapitalize = 'off'; inp.spellcheck = false;
+      inp.placeholder = '鍵を貼り付け'; inp.value = photoKey(kind);
+      const save = el('button', 'pill key-save', '保存');
+      const del = el('button', 'pill key-del', '消す');
+      const st = el('div', 'key-status muted', photoKey(kind) ? '保存しています' : 'まだありません');
+      save.onclick = async () => {
+        const v = inp.value.trim();
+        if (!v) { st.textContent = '鍵を貼ってから「保存」を押してください'; return; }
+        st.textContent = '確かめています…';
+        let good;
+        try { good = await testKey(kind, v); } catch { good = null; }
+        if (good === false) { st.textContent = 'この鍵は使えないようです。貼りまちがいがないか確かめてください'; return; }
+        localStorage.setItem('kk.key.' + kind, v); inp.value = v;
+        st.textContent = good ? '使えます。保存しました' : '保存しました（ネットにつながらず、使えるかは確かめられませんでした）';
+      };
+      del.onclick = () => { localStorage.removeItem('kk.key.' + kind); inp.value = ''; st.textContent = '消しました'; };
+      const line = el('div', 'key-line'); line.append(inp, save, del);
+      row.append(lab, line, st);
+      body.append(row);
+    }
 
     // BGM
     body.append(el('h3', 'set-h', 'BGM（本の声の後ろで小さく流す曲）'));
