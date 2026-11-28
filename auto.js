@@ -428,12 +428,19 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
   let themeList = null, themeI = 0;
   const nextTheme = async () => {
     if (!themeList) {
-      const perTheme = await Promise.all(themes.map(async ({ term, info }) => {
-        const q = info.moved ? term : (info.en || info.title);
+      // 2番目以降のテーマは、いちばんのテーマと組み合わせて探す（例：「バレエ ワークショップ」）。本の雰囲気から外れにくくする
+      const nameOf = (x, en) => x.info.moved ? x.term : (en ? x.info.en : x.info.title);
+      const main = themes[0];
+      const perTheme = await Promise.all(themes.map(async (th, idx) => {
+        const { term, info } = th;
         const ja = info.moved || !info.en;
+        const mainEn = !!main.info.en && !main.info.moved;
+        const pre = idx === 0 ? '' : ja ? nameOf(main, false) + ' ' : mainEn ? main.info.en + ' ' : '';
+        const q = pre + (info.moved ? term : (info.en || info.title));
         const jobs = [...stockJobs(q, ja)];
-        if (!info.moved) jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn, 20)]);
-        if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn, 20)]); }
+        const cq = pre + (info.en || info.title);
+        if (!info.moved) jobs.push(['commons', () => commonsSearch(cq, fetchFn, 20)]);
+        if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(cq, fetchFn, 20)]); }
         const list = await runJobs(jobs);
         return list.map(c => ({ c, info, label: info.moved ? term : info.title }));
       }));
