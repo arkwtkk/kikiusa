@@ -5,14 +5,20 @@ let dbp = null;
 
 function open() {
   if (!dbp) {
-    dbp = new Promise((resolve, reject) => {
+    const p = dbp = new Promise((resolve, reject) => {
       const r = indexedDB.open(DB_NAME, DB_VER);
       r.onupgradeneeded = () => {
         const d = r.result;
         if (!d.objectStoreNames.contains('books')) d.createObjectStore('books', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('blobs')) d.createObjectStore('blobs', { keyPath: 'id' });
       };
-      r.onsuccess = () => resolve(r.result);
+      r.onsuccess = () => {
+        const d = r.result;
+        // iPad はアプリを裏に回したあと、つなぎ目を切ることがある。切れたら次に開き直す
+        d.onclose = () => { if (dbp === p) dbp = null; };
+        d.onversionchange = () => { try { d.close(); } catch { } if (dbp === p) dbp = null; };
+        resolve(d);
+      };
       r.onerror = () => { dbp = null; reject(r.error); };
       r.onblocked = () => { dbp = null; reject(new Error('データベースを開けません（ほかの画面で開いていませんか）')); };
     });
@@ -20,9 +26,21 @@ function open() {
   return dbp;
 }
 
-function run(store, mode, fn) {
+// つなぎ目を捨てて、次の読み書きで開き直す（画面に戻ったとき・読み書きが固まったとき）
+export function reset() {
+  const old = dbp; dbp = null;
+  if (old) old.then(d => { try { d.close(); } catch { } }, () => { });
+}
+
+function run(store, mode, fn, retried = false) {
   return open().then(d => new Promise((resolve, reject) => {
-    const t = d.transaction(store, mode);
+    let t;
+    try { t = d.transaction(store, mode); }
+    catch (e) {   // つなぎ目が切れていた（InvalidStateError）→ 1回だけ開き直す
+      dbp = null;
+      if (!retried) { run(store, mode, fn, true).then(resolve, reject); return; }
+      reject(e); return;
+    }
     const s = t.objectStore(store);
     let out;
     const req = fn(s);

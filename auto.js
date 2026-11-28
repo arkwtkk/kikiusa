@@ -329,7 +329,7 @@ export function themeCandidates(wins, n = 12) {
 export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin = 3, ban = [], keys = {}, ovMax = 8, interval = 60, people = true, themeMax = 3 } = {}) {
   const total = (book.files || []).reduce((s, f) => s + (f.duration || 0), 0) || 60;
   // 区切りの長さ：本の長さ÷（最大枚数÷区切りの枚数）。ただし切り替えの間隔×区切りの枚数より短くしない（出せない写真を集めない）
-  const W = Math.min(1200, Math.max(60, perWin * interval, total / Math.ceil(max / perWin)));
+  const W = Math.max(60, perWin * interval, total / Math.ceil(max / perWin));   // 本の終わりまで行き渡るように（上限なし）
   const wins = rankWindows(buildWindows(book, W));
   const banned = new Set(ban);
   const bterms = bookTerms(book);
@@ -505,8 +505,10 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
 export function autoSchedule(book, pool, interval = 60) {
   const items = [];
   if (!pool || !pool.length) return items;
-  const anchored = pool.filter(x => x.file != null && x.t != null).slice().sort((a, b) => a.file - b.file || a.t - b.t);
-  const fillers = pool.filter(x => x.file == null || x.t == null);
+  // テーマ（雰囲気）の写真は、本のどこに出してもよい「合間の写真」として回す（同じ写真ばかりにしない）
+  const isFiller = (x) => x.file == null || x.t == null || x.kind === 'theme';
+  const anchored = pool.filter(x => !isFiller(x)).slice().sort((a, b) => a.file - b.file || a.t - b.t);
+  const fillers = pool.filter(isFiller);
   const lastShown = new Map();   // blobId → 何番目に出したか
   let step = 0, prev = null;
   // まだ出していない「合間の写真」を先に、その後は出した順の古いものから

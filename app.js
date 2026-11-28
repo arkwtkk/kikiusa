@@ -4,7 +4,7 @@ import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta,
 import * as db from './db.js';
 import { planAutoImages, wikiCredits, creditText, autoSchedule, testKey } from './auto.js';
 
-const VERSION = '0.9';
+const VERSION = '0.9.2';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -412,8 +412,22 @@ function imageList(book) {
   return items;
 }
 
+// ---------------- うまく動かなかったときの記録（設定のいちばん下に出す。原因を調べるため） ----------------
+const ERR_KEY = 'kk.errLog';
+function logErr(where, e) {
+  try {
+    const list = JSON.parse(localStorage.getItem(ERR_KEY) || '[]');
+    const msg = String((e && (e.stack || e.message)) || e || '').split('\n').slice(0, 2).join(' / ').slice(0, 200);
+    list.unshift({ at: Date.now(), where, msg, v: VERSION });
+    localStorage.setItem(ERR_KEY, JSON.stringify(list.slice(0, 8)));
+  } catch { }
+}
+window.addEventListener('error', e => logErr('error', e.error || e.message));
+window.addEventListener('unhandledrejection', e => logErr('promise', e.reason));
+
 // ---------------- 写真を自動で集める（ウィキペディア・コモンズ・Openverse・Pexels・Pixabay） ----------------
-const AUTO_MAX = 40;
+// 集める枚数：本の長さに合わせて、5分に1枚くらい（40〜120枚）。長い本で同じ写真ばかりにならないように
+const autoMax = (book) => { const sec = (book.files || []).reduce((a, f) => a + (f.duration || 0), 0); return Math.min(120, Math.max(40, Math.ceil(sec / 300))); };
 const photoKey = (kind) => (localStorage.getItem('kk.key.' + kind) || '').trim();
 const autoPeopleOn = () => localStorage.getItem('kk.autoPeople') === '1';   // 人物の写真（初期はオフ）
 // 集め先ごとの数（知らせ用）
@@ -447,12 +461,12 @@ async function runAutoQueue() {
     }
   } finally { autoBusy = false; }
 }
-// 本の中身から言葉を拾い、写真を最大40枚ダウンロードして保存する
+// 本の中身から言葉を拾い、写真を本の長さに合わせて40〜120枚ダウンロードして保存する
 async function collectAutoImages(book, manual) {
   if (manual) toast(`「${book.title}」の写真を集めています…`, 4000);
   let plan;
   try {
-    plan = await planAutoImages(book, { max: AUTO_MAX, interval: slideSec, people: autoPeopleOn(), ban: (book.auto && book.auto.ban) || [], keys: { pexels: photoKey('pexels'), pixabay: photoKey('pixabay') } });
+    plan = await planAutoImages(book, { max: autoMax(book), interval: slideSec, people: autoPeopleOn(), ban: (book.auto && book.auto.ban) || [], keys: { pexels: photoKey('pexels'), pixabay: photoKey('pixabay') } });
   } catch (e) {
     book.auto = { ...(book.auto || {}), failAt: Date.now() };
     await db.putBook(book).catch(() => { });
@@ -1113,9 +1127,10 @@ function onEnded() {
 }
 
 window.addEventListener('pagehide', saveNow);
+window.addEventListener('pageshow', (e) => { if (e.persisted) { db.reset(); refreshOverlay(); } });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') saveNow();
-  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); sweepExpired(); bgmSync(); }
+  else { db.reset(); renderPlayer(); refreshOverlay(); if (!$('library').hidden) renderLibrary(); sweepExpired(); bgmSync(); }
   wakeSync();
 });
 
@@ -1235,9 +1250,17 @@ function renderTimes() {
     : `本の残り ${jaDur(left)}${r}`;
   $('btnPrev').disabled = false;
   $('btnNext').disabled = i + 1 >= b.chapters.length;
-  renderSubtitle();
-  renderSlide();
+  renderOverlay();
 }
+// 字幕と写真。片方がうまくいかなくても、もう片方は動くように別々に
+function renderOverlay() {
+  try { renderSubtitle(); } catch (e) { subShown = undefined; logErr('subtitle', e); }
+  try { renderSlide(); } catch (e) { slideShown = undefined; logErr('slide', e); }
+}
+// 再生の知らせ（timeupdate）が来なくても、0.5秒ごとに字幕と写真を合わせる
+setInterval(() => { if (P.book && !$('player').hidden && document.visibilityState === 'visible') renderOverlay(); }, 500);
+// 画面に戻ったら、字幕と写真を出し直す（止まったままの絵を残さない）
+function refreshOverlay() { subShown = undefined; slideShown = undefined; slideLoadAt = 0; renderOverlay(); }
 
 function renderPlayState() {
   const playing = !audio.paused;
@@ -1558,7 +1581,9 @@ const imgUrls = new Map();   // blobId -> object URL（最近の数枚だけ）
 let slideShown = null;
 async function imageUrl(id) {
   if (imgUrls.has(id)) return imgUrls.get(id);
-  const b = await db.getBlob(id).catch(() => null);
+  let b;
+  try { b = await db.getBlob(id); }
+  catch (e) { logErr('imageUrl', e); db.reset(); b = await db.getBlob(id).catch(() => null); }   // 保存場所に1回つなぎ直す
   if (!b || !b.size) return null;
   const u = URL.createObjectURL(b);
   imgUrls.set(id, u);
@@ -1590,19 +1615,27 @@ function markBadImage(id) {
 $('slideImg').addEventListener('error', () => {
   if (slideShown && $('slideImg').getAttribute('src')) markBadImage(slideShown);
 });
+let slideLoadAt = 0, slideLoaded = null;
 function renderSlide() {
   const x = currentImage();
   const id = x ? x.blobId : null;
-  if (id === slideShown) return;
+  if (id === slideShown) {
+    // 読み込みが8秒たっても終わらない（iPad の保存場所が固まった）ときは、つなぎ直して読み直す
+    if (id && slideLoaded !== id && slideLoadAt && Date.now() - slideLoadAt > 8000) {
+      logErr('slide', '写真の読み込みが終わらない ' + id);
+      db.reset(); imgUrls.delete(id); slideShown = undefined; slideLoadAt = 0;
+    } else return;
+  }
   slideShown = id;
   const box = $('slide');
-  if (!x) { box.hidden = true; $('slideImg').removeAttribute('src'); return; }
+  if (!x) { box.hidden = true; $('slideImg').removeAttribute('src'); slideLoaded = null; slideLoadAt = 0; return; }
+  slideLoadAt = Date.now();
   imageUrl(id).then(u => {
     if (slideShown !== id) return;
     if (!u) { markBadImage(id); return; }
     const img = $('slideImg');
     img.classList.remove('kb');
-    img.onload = () => { if (slideShown === id) box.hidden = false; };   // 読めてから出す（「？」を出さない）
+    img.onload = () => { if (slideShown === id) { box.hidden = false; slideLoaded = id; slideLoadAt = 0; } };   // 読めてから出す（「？」を出さない）
     img.src = u;
     void img.offsetWidth;
     img.classList.add('kb');
@@ -1785,7 +1818,7 @@ async function openSettings() {
       secRow.append(sb);
     }
     body.append(secRow);
-    body.append(el('p', 'muted', '本のあちこちに出てくる言葉から「この本のテーマ」（例：バレエ・ダンサー）を見つけて雰囲気の写真を集め、場所・建物・作品・行事などの名前が出てきたところでは、その写真を出します（本を取り込んだとき・開いたときに、最大40枚）。「ワークショップ」「花屋」のような一般的な言葉の写真は使いません。集め先は、ウィキペディア・ウィキメディア・コモンズ・Openverse（Flickr などの写真）と、鍵を貼ったときは Pixabay です。'));
+    body.append(el('p', 'muted', '本のあちこちに出てくる言葉から「この本のテーマ」（例：バレエ・ダンサー）を見つけて雰囲気の写真を集め、場所・建物・作品・行事などの名前が出てきたところでは、その写真を出します（本を取り込んだとき・開いたときに、本の長さに合わせて40〜120枚）。「ワークショップ」「花屋」のような一般的な言葉の写真は使いません。集め先は、ウィキペディア・ウィキメディア・コモンズ・Openverse（Flickr などの写真）と、鍵を貼ったときは Pixabay です。'));
     body.append(el('p', 'muted', '人物の写真：オンにすると、実在の人の名前が出てきたところで、その人のウィキペディアの写真を出します（自伝・『私の履歴書』向け）。小説では作中の人物と関係のない写真になりやすいので、初めはオフです。変えたあと、前に集めた本は、本の「…」→「写真を集め直す」で入れ替わります。合わない写真は、写真を押して全画面にし「この写真を外す」で外せます。'));
     // 写真サイトの鍵（Pexels・Pixabay）
     body.append(el('h3', 'set-h', '写真サイトの鍵（無料・なくても使えます）'));
@@ -1882,6 +1915,17 @@ async function openSettings() {
     body.append(volRow);
     body.append(el('p', 'muted', 'チェックを付けた曲を、順番かシャッフルで繰り返し流します。曲名を押すとその曲に替わります。本を止めると BGM も止まります。再生画面の［BGM］で、あり・なしを切り替えられます。画面をロックしている間は BGM が止まることがあります（本の声は続きます）。'));
     if (usage != null) body.append(el('p', 'set-usage', `ききウサが使っている容量 約 ${size(usage)}` + (free != null ? `（空きの目安 ${size(free)}）` : '')));
+    let errs = []; try { errs = JSON.parse(localStorage.getItem(ERR_KEY) || '[]'); } catch { }
+    if (errs.length) {
+      const pad = n => String(n).padStart(2, '0');
+      const box = el('div', 'set-errs');
+      box.append(el('h3', null, '最近うまく動かなかったこと（調べる用）'));
+      for (const x of errs) { const d = new Date(x.at); box.append(el('p', 'muted', `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}（v${x.v}・${x.where}）${x.msg}`)); }
+      const clr = el('button', 'pill', '記録を消す');
+      clr.onclick = () => { localStorage.removeItem(ERR_KEY); box.remove(); };
+      box.append(clr);
+      body.append(box);
+    }
     actions(body, [['閉じる', 'go', closeSheet]]);
   });
 }
