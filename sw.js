@@ -1,6 +1,6 @@
 // sw.js — アプリの画面をiPadに保存して、ネットがなくても開けるようにする
 // 版を上げるときは CACHE の名前を変える
-const CACHE = 'kikiusa-v0.6';
+const CACHE = 'kikiusa-v0.7';
 const FILES = [
   './', './index.html', './style.css', './app.js', './parse.js', './db.js', './auto.js',
   './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png',

@@ -246,3 +246,8 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
 /* v0.6 写真を自動で集める */
 .viewer-del { position: absolute; right: 16px; top: calc(16px + env(safe-area-inset-top)); background: rgba(255,255,255,.14); color: #fff; border-radius: 999px; padding: 8px 14px; font-size: 14px; }
 .slide-sec .pill { min-width: 64px; padding: 6px 14px; }
+
+/* v0.7 本棚の切り替え */
+.shelf-tabs { display: flex; gap: 10px; margin: 0 0 16px; flex-wrap: wrap; }
+.shelf-tabs .pill { min-width: 0; padding: 9px 20px; }
+.shelf-none { text-align: center; margin: 40px auto; max-width: 520px; line-height: 1.7; }

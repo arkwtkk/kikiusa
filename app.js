@@ -4,7 +4,7 @@ import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta,
 import * as db from './db.js';
 import { planAutoImages, wikiCredits, creditText, autoSchedule } from './auto.js';
 
-const VERSION = '0.6';
+const VERSION = '0.7';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -151,15 +151,33 @@ function fillCover(box, book) {
 
 async function refreshLibrary() {
   books = await db.allBooks();
+  // 開いている本は P.book と同じものを使う（聞き終わりの印などがずれないように）
+  if (P.book) books = books.map(b => b.id === P.book.id ? P.book : b);
   books.sort((a, b) => lastActivity(b) - lastActivity(a));
   renderLibrary();
+}
+
+let shelfTab = 'now';   // 'now'（聞いている）／'done'（聞き終わった）。開くたびに「聞いている」から
+
+function renderShelfTabs(nDone, nNow) {
+  const tabs = $('shelfTabs');
+  tabs.hidden = nDone === 0;
+  $('tabNow').textContent = `聞いている（${nNow}）`;
+  $('tabDone').textContent = `聞き終わった（${nDone}）`;
+  $('tabNow').classList.toggle('on', shelfTab === 'now');
+  $('tabDone').classList.toggle('on', shelfTab === 'done');
 }
 
 function renderLibrary() {
   const grid = $('books');
   grid.replaceChildren();
   $('empty').hidden = books.length > 0;
-  for (const b of books) {
+  const nDone = books.filter(b => b.finished).length;
+  if (nDone === 0) shelfTab = 'now';
+  renderShelfTabs(nDone, books.length - nDone);
+  const shown = books.filter(b => !!b.finished === (shelfTab === 'done'));
+  $('shelfNone').hidden = !(books.length > 0 && shown.length === 0);
+  for (const b of shown) {
     const card = el('div', 'card' + (P.book && P.book.id === b.id ? ' now' : ''));
     const cov = el('div', 'cover');
     fillCover(cov, b);
@@ -212,6 +230,7 @@ function bookMenu(b) {
     });
     add(b.finished ? '「聞き終わり」を外す' : '聞き終わりにする', async () => {
       closeSheet(); b.finished = !b.finished; await db.putBook(b); renderLibrary();
+      toast(b.finished ? '「聞き終わった」に移しました' : '「聞いている」に戻しました');
     });
     add('字幕・写真を追加', () => {
       closeSheet(); subTarget = b;
@@ -1077,7 +1096,40 @@ window.addEventListener('pagehide', saveNow);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') saveNow();
   else { renderPlayer(); if (!$('library').hidden) renderLibrary(); sweepExpired(); bgmSync(); }
+  wakeSync();
 });
+
+// ---------------- 再生中は画面を消さない（Wake Lock） ----------------
+// 頼めるのは画面が見えているときだけ。ほかのアプリに切り替えると iPad が取り消すので、戻ったら頼み直す。
+
+let wakeLock = null, wakeBusy = false, wakeTimer = 0, wakeCount = 0;
+const wakeSupported = () => 'wakeLock' in navigator;
+function keepAwakeOn() { return localStorage.getItem('kk.awake') !== '0'; }
+function wakeWanted() { return keepAwakeOn() && !!P.book && !audio.paused && document.visibilityState === 'visible'; }
+
+async function wakeSync() {
+  clearTimeout(wakeTimer);
+  if (!wakeSupported()) return;
+  if (wakeWanted()) {
+    if (wakeLock || wakeBusy) return;
+    wakeBusy = true;
+    try {
+      const w = await navigator.wakeLock.request('screen');
+      wakeCount++;
+      w.addEventListener('release', () => { if (wakeLock === w) wakeLock = null; });
+      wakeLock = w;
+      if (!wakeWanted()) wakeSync();   // 頼んでいるあいだに止めた
+    } catch { wakeLock = null; }
+    finally { wakeBusy = false; }
+  } else if (wakeLock) {
+    // 章の切り替えなどで一瞬止まるだけのときは消さない
+    wakeTimer = setTimeout(async () => {
+      if (wakeWanted() || !wakeLock) return;
+      const w = wakeLock; wakeLock = null;
+      try { await w.release(); } catch { }
+    }, 1500);
+  }
+}
 
 // ---------------- ロック画面・コントロールセンター ----------------
 
@@ -1665,6 +1717,21 @@ async function openSettings() {
     const n = books.filter(b => b.expireAt).length;
     if (n) body.append(el('p', 'muted', `期限の付いた本：${n}冊`));
 
+    // 画面
+    body.append(el('h3', 'set-h', '画面'));
+    const opts3 = el('div', 'opts');
+    const wk = el('button', 'set-awake');
+    const wkSub = el('span', 'sub', '');
+    const showWk = () => { const on = keepAwakeOn(); wkSub.textContent = on ? 'オン' : 'オフ'; wk.classList.toggle('sel', on); };
+    wk.append(el('span', null, '再生中は画面を消さない'), wkSub);
+    wk.onclick = () => { localStorage.setItem('kk.awake', keepAwakeOn() ? '0' : '1'); showWk(); wakeSync(); };
+    showWk();
+    opts3.append(wk);
+    body.append(opts3);
+    body.append(el('p', 'muted', wakeSupported()
+      ? '再生しているあいだは iPad の画面が自動で消えません（写真も見続けられます）。一時停止すると、いつもどおり消えます。画面がついているぶん電池を使います。'
+      : 'この iPad では使えません（iPadOS 18.4 以降で使えます）。'));
+
     // 写真のスライドショー
     body.append(el('h3', 'set-h', '写真（日経の記事の写真がない本）'));
     const opts2 = el('div', 'opts');
@@ -1788,10 +1855,13 @@ async function start() {
   }
 }
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
-audio.addEventListener('playing', () => bgmSync());
-audio.addEventListener('pause', () => bgmSync());
+audio.addEventListener('playing', () => { bgmSync(); wakeSync(); });
+audio.addEventListener('pause', () => { bgmSync(); wakeSync(); });
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, sweepExpired, todayStr, bgmAudio, queueAutoImages, imageList, get autoBusy() { return autoBusy || autoQueue.length > 0; }, get slideSec() { return slideSec; }, get bgm() { return { list: bgmList, on: bgmOn, vol: bgmVol, cur: bgmCur, shuffle: bgmShuffle, loadedId: bgmLoadedId, gain: bgmGain ? bgmGain.gain.value : null, ctx: bgmCtx ? bgmCtx.state : null }; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
+window.__kk = { get wake() { return { on: !!wakeLock, count: wakeCount }; }, get shelfTab() { return shelfTab; }, P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, sweepExpired, todayStr, bgmAudio, queueAutoImages, imageList, get autoBusy() { return autoBusy || autoQueue.length > 0; }, get slideSec() { return slideSec; }, get bgm() { return { list: bgmList, on: bgmOn, vol: bgmVol, cur: bgmCur, shuffle: bgmShuffle, loadedId: bgmLoadedId, gain: bgmGain ? bgmGain.gain.value : null, ctx: bgmCtx ? bgmCtx.state : null }; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
+
+$('tabNow').onclick = () => { shelfTab = 'now'; renderLibrary(); };
+$('tabDone').onclick = () => { shelfTab = 'done'; renderLibrary(); };
 
 start();

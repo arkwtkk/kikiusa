@@ -38,7 +38,12 @@
     Safari の共有ボタン <span class="share">⬆︎</span> →「ホーム画面に追加」で追加し、ホーム画面の「ききウサ」から本を取り込みます（Safari で取り込んだ本は、ホーム画面のききウサからは見えません）。
   </div>
   <main class="lib-main">
+    <div id="shelfTabs" class="shelf-tabs" hidden>
+      <button id="tabNow" class="pill on">聞いている</button>
+      <button id="tabDone" class="pill">聞き終わった</button>
+    </div>
     <div id="books" class="grid"></div>
+    <div id="shelfNone" class="shelf-none muted" hidden>聞いている本はありません。「＋ 本を取り込む」で本を足すか、「聞き終わった」から聞き直す本を開いてください。</div>
     <div id="empty" class="empty" hidden>
       <div class="empty-title">本棚はまだ空です</div>
       <ol>
