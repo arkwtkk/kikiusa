@@ -242,3 +242,7 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
 .bgm-add { font-size: 15px; font-weight: 600; color: var(--accent); padding: 6px 0; }
 .bgm-vol { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
 .bgm-vol .pill { min-width: 64px; padding: 6px 14px; }
+
+/* v0.6 写真を自動で集める */
+.viewer-del { position: absolute; right: 16px; top: calc(16px + env(safe-area-inset-top)); background: rgba(255,255,255,.14); color: #fff; border-radius: 999px; padding: 8px 14px; font-size: 14px; }
+.slide-sec .pill { min-width: 64px; padding: 6px 14px; }
