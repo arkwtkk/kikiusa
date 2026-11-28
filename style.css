@@ -260,3 +260,5 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
 .key-input { flex: 1; min-width: 0; font: inherit; font-size: 15px; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,.18); background: var(--card); color: inherit; }
 .key-line .pill { min-width: 0; padding: 8px 14px; }
 .key-status { font-size: 13px; margin-top: 4px; }
+.key-steps { padding-left: 1.4em; margin: 4px 0 10px; font-size: 14px; line-height: 1.6; }
+.key-steps li { margin: 3px 0; }

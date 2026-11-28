@@ -91,6 +91,7 @@ export function rankWindows(wins, top = 8) {
   const N = wins.length;
   wins.forEach((w, i) => {
     const m = per[i];
+    w.all = m;
     w.terms = [...m.entries()]
       .map(([k, tf]) => [k, tf * (1 + 0.15 * Math.min(k.length, 8)) * Math.log(1 + N / (df.get(k) || 1)) * (tf >= 2 ? 1.3 : 1)])
       .sort((a, b) => b[1] - a[1])
@@ -128,6 +129,8 @@ const pageInfo = (p) => p && !p.missing && !(p.pageprops && 'disambiguation' in 
   }
   : null;
 
+export const normTitle = (t) => String(t || '').normalize('NFKC').replace(/\s*[(（][^)）]*[)）]\s*$/, '').replace(/[・･\s=＝]/g, '');
+
 // 言葉（記事名）→ 記事の代表画像。50件ずつまとめて問い合わせる
 export async function wikiLookup(titles, fetchFn = fetch, size = THUMB) {
   const out = new Map();
@@ -144,7 +147,8 @@ export async function wikiLookup(titles, fetchFn = fetch, size = THUMB) {
     for (const [k, v] of final) {
       const info = pageInfo(byTitle.get(v));
       // 別の意味の記事に転送された（「港町」→「港湾都市」）ものは、あとで後回しにする
-      if (info) out.set(k, { ...info, moved: !v.includes(k) });
+      // 「・」・空白・（かっこ）の違いは同じ意味として扱う（セントラルパーク→セントラル・パーク）
+      if (info) out.set(k, { ...info, moved: !normTitle(v).includes(normTitle(k)) });
     }
   }
   return out;
@@ -288,70 +292,88 @@ export async function personSet(qids, fetchFn = fetch) {
   return out;
 }
 
+// 何の名前か（ウィキデータ）：人・場所・建物・団体・行事・作品。どれでもなければ一般的な言葉（ワークショップ・花屋・仏像・バレエ）。
+// 返すのは qid → Set('person'|'place'|'structure'|'org'|'event'|'work')
+export const KINDS = { Q5: 'person', Q2221906: 'place', Q811979: 'structure', Q43229: 'org', Q1656682: 'event', Q386724: 'work', Q17537576: 'work' };
+export async function classify(qids, fetchFn = fetch) {
+  const out = new Map();
+  const ids = [...new Set(qids.filter(q => /^Q\d+$/.test(q || '')))];
+  for (let i = 0; i < ids.length; i += 150) {
+    const part = ids.slice(i, i + 150);
+    const q = `SELECT ?item ?cls WHERE { VALUES ?item { ${part.map(x => 'wd:' + x).join(' ')} } VALUES ?cls { ${Object.keys(KINDS).map(k => 'wd:' + k).join(' ')} } ?item wdt:P31/wdt:P279* ?cls }`;
+    const j = await getJson(fetchFn, `${SPARQL}?format=json&query=${enc(q)}`, { headers: { Accept: 'application/sparql-results+json', ...HDR.headers } });
+    for (const b of ((j.results || {}).bindings || [])) {
+      const id = String(b.item.value).split('/').pop(), k = KINDS[String(b.cls.value).split('/').pop()];
+      if (!k) continue;
+      if (!out.has(id)) out.set(id, new Set());
+      out.get(id).add(k);
+    }
+  }
+  return out;
+}
+
+// 本のテーマの候補：本のあちこち（区切りの15%以上）に出る言葉。『spring』ならバレエ・ダンサー・振付
+export function themeCandidates(wins, n = 12) {
+  const N = wins.length;
+  const tf = new Map(), df = new Map();
+  for (const w of wins) for (const [k, v] of (w.all || new Map())) { tf.set(k, (tf.get(k) || 0) + v); df.set(k, (df.get(k) || 0) + 1); }
+  const minDf = N >= 4 ? Math.max(2, Math.ceil(N * 0.15)) : 1;
+  return [...tf.keys()].filter(k => df.get(k) >= minDf && tf.get(k) >= 3)
+    .sort((a, b) => (df.get(b) * Math.log(1 + tf.get(b))) - (df.get(a) * Math.log(1 + tf.get(a))))
+    .slice(0, n);
+}
+
 // 本に合う写真を選ぶ（まだダウンロードしない）。
 // 返すのは [{term, label, file(音声の番号)|null, t(秒)|null, thumb, alt?, fileName?, credit?, site, src, key}]
 // 区切りごとに perWin 枚まで：1) 記事の代表画像 2) その言葉の、ほかの集め先の写真を順番に（記事の中の写真・Pexels・Pixabay・コモンズ・Openverse）
-export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin = 3, ban = [], keys = {}, ovMax = 8, interval = 60 } = {}) {
+export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin = 3, ban = [], keys = {}, ovMax = 8, interval = 60, people = true, themeMax = 3 } = {}) {
   const total = (book.files || []).reduce((s, f) => s + (f.duration || 0), 0) || 60;
   // 区切りの長さ：本の長さ÷（最大枚数÷区切りの枚数）。ただし切り替えの間隔×区切りの枚数より短くしない（出せない写真を集めない）
   const W = Math.min(1200, Math.max(60, perWin * interval, total / Math.ceil(max / perWin)));
   const wins = rankWindows(buildWindows(book, W));
   const banned = new Set(ban);
   const bterms = bookTerms(book);
+  const themeCand = themeCandidates(wins).filter(t => !banned.has(t));
   const cand = [];
   const seen = new Set();
   const push = (t) => { if (!seen.has(t) && !banned.has(t)) { seen.add(t); cand.push(t); } };
+  themeCand.forEach(push);
   for (const w of wins) w.terms.forEach(push);
   bterms.forEach(push);
   const lookup = await wikiLookup(cand.slice(0, 450), fetchFn);
   for (const [k, v] of [...lookup]) if (banned.has(v.title)) lookup.delete(k);
-  const notes = { bad: {}, errors: 0 };
-  // 人の名前か（失敗したら、すべて人として扱い、別人の写真が出る集め先は使わない）
-  let persons = null;
-  try { persons = await personSet([...lookup.values()].map(v => v.qid), fetchFn); } catch { persons = null; }
-  const isPerson = (info) => !persons || persons.has(info.qid);
+  const notes = { bad: {}, errors: 0, themes: [] };
+  // 何の名前か（ウィキデータ）。届かなければ「特定のもの」として扱う（前の版と同じく代表画像と記事の写真だけ）
+  let kinds = null;
+  try { kinds = await classify([...lookup.values()].map(v => v.qid), fetchFn); } catch { kinds = null; notes.noKinds = true; }
+  const kindOf = (info) => {
+    if (!kinds || !info.qid) return 'named?';
+    const k = kinds.get(info.qid);
+    if (!k || !k.size) return 'concept';
+    return k.has('person') ? 'person' : 'named';
+  };
 
   const usedKey = new Set();
   const usedLead = new Set();
   const out = [];
   let ovLeft = ovMax;
-  const add = (c, info, label, file, t) => {
+  const add = (c, info, label, file, t, kind) => {
     if (!c || usedKey.has(c.key) || banned.has(c.key)) return false;
     usedKey.add(c.key);
     if (c.fileName) usedKey.add('f:' + normFile(c.fileName));
-    out.push({ term: info.title, label, file, t, thumb: c.thumb, alt: c.alt, fileName: c.fileName, credit: c.credit, site: c.site, src: c.src, key: c.key });
+    out.push({ term: info.title, label, file, t, thumb: c.thumb, alt: c.alt, fileName: c.fileName, credit: c.credit, site: c.site, src: c.src, key: c.key, kind });
     return true;
   };
   const takeLead = (info, file, t) => {
     if (!goodImage(info) || usedLead.has(info.title)) return false;
     const c = { thumb: info.thumb, fileName: info.file, site: 'ウィキペディア', src: 'wiki', key: 'f:' + normFile(info.file) };
-    if (!add(c, info, info.title, file, t)) return false;
+    if (!add(c, info, info.title, file, t, kindOf(info))) return false;
     usedLead.add(info.title);
     return true;
   };
-  // 言葉ごとの、ほかの集め先の写真（はじめて使うときにまとめて問い合わせ、集め先を順番に混ぜる）
-  const ext = new Map();
-  const extFor = async (term) => {
-    if (ext.has(term)) return ext.get(term);
-    const info = lookup.get(term);
-    const lists = [];
-    const person = isPerson(info);
-    // 英語の名前があれば写真サイトは英語で探す（なければ日本語で）
-    const q = info.moved ? term : (info.en || info.title);
-    const jaQ = info.moved || !info.en;
-    // 混ぜる順：写真サイト（鍵があるとき）→ 記事の中の写真 → コモンズ → Openverse
-    const jobs = [];
-    if (!person) {
-      if (keys.pexels && !notes.bad.pexels) jobs.push(['pexels', () => pexelsSearch(q, keys.pexels, fetchFn, 8, jaQ ? 'ja-JP' : '')]);
-      if (keys.pixabay && !notes.bad.pixabay) jobs.push(['pixabay', () => pixabaySearch(q, keys.pixabay, fetchFn, 8, jaQ ? 'ja' : '')]);
-    }
-    if (!info.moved) jobs.push(['wiki', () => wikiArticleImages(info.title, fetchFn)]);
-    if (!person) {
-      if (!info.moved) jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn)]);
-      if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn)]); }
-    }
+  const runJobs = async (jobs) => {
     // 集め先はそれぞれ別のサイトなので、同時に問い合わせる（混ぜる順は jobs の順のまま）
-    const results = await Promise.all(jobs.map(async ([name, fn]) => {
+    const lists = await Promise.all(jobs.map(async ([name, fn]) => {
       try { return await fn(); }
       catch (e) {
         if ((name === 'pexels' || name === 'pixabay') && e && (e.status === 401 || e.status === 403 || e.status === 400)) notes.bad[name] = true;
@@ -360,55 +382,102 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
         return [];
       }
     }));
-    for (const r of results) lists.push(r);
-    // 集め先を順番に1枚ずつ混ぜる
     const merged = [];
     for (let k = 0; lists.some(l => l.length > k); k++) for (const l of lists) if (l[k]) merged.push(l[k]);
-    const st = { list: merged, i: 0 };
-    ext.set(term, st);
-    return st;
+    return merged;
   };
+  const stockJobs = (q, ja) => {
+    const jobs = [];
+    if (keys.pixabay && !notes.bad.pixabay) jobs.push(['pixabay', () => pixabaySearch(q, keys.pixabay, fetchFn, 10, ja ? 'ja' : '')]);
+    if (keys.pexels && !notes.bad.pexels) jobs.push(['pexels', () => pexelsSearch(q, keys.pexels, fetchFn, 10, ja ? 'ja-JP' : '')]);
+    return jobs;
+  };
+  const fresh = (c) => c && !usedKey.has(c.key) && !banned.has(c.key) && !(c.fileName && usedKey.has('f:' + normFile(c.fileName)));
+
+  // 特定のもの（場所・建物・団体・行事・作品）と人：代表画像のほかに、記事の中の写真・写真サイト・コモンズ・Openverse
+  const ext = new Map();
   const nextExt = async (term) => {
-    const st = await extFor(term);
-    while (st.i < st.list.length) {
-      const c = st.list[st.i++];
-      if (!usedKey.has(c.key) && !banned.has(c.key) && !(c.fileName && usedKey.has('f:' + normFile(c.fileName)))) return c;
+    let st = ext.get(term);
+    if (!st) {
+      const info = lookup.get(term);
+      const person = kindOf(info) !== 'named';   // 人と、何か分からないもの
+      const jobs = [];
+      if (!person) jobs.push(...stockJobs(info.en || info.title, !info.en));
+      jobs.push(['wiki', () => wikiArticleImages(info.title, fetchFn)]);
+      if (!person) {
+        jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn)]);
+        if (info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn)]); }
+      }
+      st = { list: await runJobs(jobs), i: 0 };
+      ext.set(term, st);
     }
+    while (st.i < st.list.length) { const c = st.list[st.i++]; if (fresh(c)) return c; }
     return null;
   };
 
-  // ひとつの区切り（または本全体）を埋める
-  const fill = async (terms, file, tAt, limit) => {
-    const infos = terms.map(t => [t, lookup.get(t)]).filter(([, v]) => v);
-    const order = [...infos.filter(([, v]) => !v.moved), ...infos.filter(([, v]) => v.moved)];
-    let got = 0;
-    // 1) 記事の代表画像（別の意味に転送された言葉は使わない）。1枠はほかの集め先のために空けておく
-    const leadMax = limit > 1 ? limit - 1 : limit;
-    for (const [, info] of order) {
-      if (got >= leadMax || out.length >= max) break;
-      if (!info.moved && takeLead(info, file, tAt(got))) got++;
+  // 本のテーマ（本のあちこちに出る、人の名前でない言葉）：写真サイト・コモンズ・Openverse で雰囲気の写真を探す
+  const themes = [];
+  for (const t of (kinds ? themeCand : [])) {   // 何の名前か分からなければテーマは使わない（人の名前かもしれないため）
+    const info = lookup.get(t);
+    if (!info || kindOf(info) === 'person') continue;
+    if (themes.some(x => x.info.title === info.title)) continue;
+    themes.push({ term: t, info });
+    if (themes.length >= themeMax) break;
+  }
+  notes.themes = themes.map(x => x.info.moved ? x.term : x.info.title);
+  let themeList = null, themeI = 0;
+  const nextTheme = async () => {
+    if (!themeList) {
+      const perTheme = await Promise.all(themes.map(async ({ term, info }) => {
+        const q = info.moved ? term : (info.en || info.title);
+        const ja = info.moved || !info.en;
+        const jobs = [...stockJobs(q, ja)];
+        if (!info.moved) jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn, 20)]);
+        if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn, 20)]); }
+        const list = await runJobs(jobs);
+        return list.map(c => ({ c, info, label: info.moved ? term : info.title }));
+      }));
+      // テーマを順番に1枚ずつ
+      themeList = [];
+      for (let k = 0; perTheme.some(l => l.length > k); k++) for (const l of perTheme) if (l[k]) themeList.push(l[k]);
     }
-    if (got >= limit || out.length >= max) return got;
-    // 2) 上位の言葉から、ほかの集め先の写真
-    const top = order.slice(0, 3);
+    while (themeI < themeList.length) { const x = themeList[themeI++]; if (fresh(x.c)) return x; }
+    return null;
+  };
+
+  // ひとつの区切りを埋める：1) 特定のもの（と、設定でオンなら人）の写真 2) 残りはテーマの写真
+  const fill = async (terms, file, tAt, limit) => {
+    // 転送で別の記事になった言葉は、その記事が特定のもの（場所など）なら使う（港町→港湾都市は一般的な言葉なので使わない）
+    const infos = terms.map(t => [t, lookup.get(t)]).filter(([, v]) => v && (!v.moved || kindOf(v) === 'named'));
+    const named = infos.filter(([, v]) => { const k = kindOf(v); return k === 'named' || k === 'named?' || (people && k === 'person'); });
+    let got = 0;
+    // 1) 代表画像（テーマの写真のために1枠空ける。テーマがなければ全部）
+    const leadMax = themes.length && limit > 1 ? limit - 1 : limit;
+    for (const [, info] of named) {
+      if (got >= leadMax || out.length >= max) break;
+      if (takeLead(info, file, tAt(got))) got++;
+    }
+    // 2) テーマの写真を1枚
+    if (themes.length && got < limit && out.length < max) {
+      const x = await nextTheme();
+      if (x && add(x.c, { title: x.label }, x.label, file, tAt(got), 'theme')) got++;
+    }
+    // 3) 上位の特定のものから、ほかの集め先の写真
+    const top = named.slice(0, 3);
     let progress = true;
     while (got < limit && out.length < max && progress) {
       progress = false;
       for (const [term, info] of top) {
         if (got >= limit || out.length >= max) break;
         const c = await nextExt(term);
-        if (c && add(c, info, c.src === 'wiki' ? `${info.title}（記事の写真）` : (info.moved ? term : info.title), file, tAt(got))) { got++; progress = true; }
+        if (c && add(c, info, c.src === 'wiki' ? `${info.title}（記事の写真）` : info.title, file, tAt(got), kindOf(info))) { got++; progress = true; }
       }
     }
-    // 3) ほかの集め先がなければ、残りの枠も代表画像で
-    for (const [, info] of order) {
-      if (got >= limit || out.length >= max) return got;
-      if (!info.moved && takeLead(info, file, tAt(got))) got++;
-    }
-    // 4) それでも空いていれば、転送された記事の代表画像（前の版と同じ後回し）
-    for (const [, info] of order) {
-      if (got >= limit || out.length >= max) return got;
-      if (info.moved && takeLead(info, file, tAt(got))) got++;
+    // 4) まだ空いていればテーマの写真で埋める
+    while (themes.length && got < limit && out.length < max) {
+      const x = await nextTheme();
+      if (!x) break;
+      if (add(x.c, { title: x.label }, x.label, file, tAt(got), 'theme')) got++;
     }
     return got;
   };
@@ -419,10 +488,7 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
   }
   // 字幕のない本などで少ないときは、本全体の言葉で足す（時刻なし＝合間に出す）。
   // 題名や作者名での検索はしない（同じ名前の別人の写真が出るため）
-  if (out.length < 4) {
-    const nonMoved = bterms.filter(t => lookup.get(t) && !lookup.get(t).moved);
-    await fill(nonMoved, null, () => null, Math.min(max, 8) - out.length);
-  }
+  if (out.length < 4) await fill(bterms, null, () => null, Math.min(max, 8) - out.length);
   out.notes = notes;
   return out;
 }

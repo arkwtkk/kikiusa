@@ -4,7 +4,7 @@ import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta,
 import * as db from './db.js';
 import { planAutoImages, wikiCredits, creditText, autoSchedule, testKey } from './auto.js';
 
-const VERSION = '0.8';
+const VERSION = '0.9';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -217,7 +217,7 @@ function bookMenu(b) {
     body.append(el('h2', null, b.title));
     const info = el('p', 'muted', `${b.chapters.length}章・${jaDur(b.duration)}・${size(b.files.reduce((s, f) => s + (f.size || 0), 0))}`
       + (b.expireAt ? `・${md(b.expireAt)} に自動で消えます` : '')
-      + (hasImages(b) ? `・写真 ${b.images.length}枚` : hasAutoImages(b) ? `・写真 ${b.auto.pool.length}枚（自動で集めた写真）` : ''));
+      + (hasImages(b) ? `・写真 ${b.images.length}枚` : hasAutoImages(b) ? `・写真 ${b.auto.pool.length}枚（自動で集めた写真${b.auto.themes && b.auto.themes.length ? `・テーマ：${b.auto.themes.join('・')}` : ''}）` : ''));
     const opts = el('div', 'opts');
     const add = (label, fn, cls) => { const x = el('button', cls, label); x.onclick = fn; opts.append(x); };
     add('名前を変える', () => renameBook(b));
@@ -415,6 +415,7 @@ function imageList(book) {
 // ---------------- 写真を自動で集める（ウィキペディア・コモンズ・Openverse・Pexels・Pixabay） ----------------
 const AUTO_MAX = 40;
 const photoKey = (kind) => (localStorage.getItem('kk.key.' + kind) || '').trim();
+const autoPeopleOn = () => localStorage.getItem('kk.autoPeople') === '1';   // 人物の写真（初期はオフ）
 // 集め先ごとの数（知らせ用）
 const SRC_NAME = { wiki: 'ウィキペディア', commons: 'ウィキペディア', openverse: 'Openverse', pexels: 'Pexels', pixabay: 'Pixabay' };
 function srcSummary(pool) {
@@ -451,7 +452,7 @@ async function collectAutoImages(book, manual) {
   if (manual) toast(`「${book.title}」の写真を集めています…`, 4000);
   let plan;
   try {
-    plan = await planAutoImages(book, { max: AUTO_MAX, interval: slideSec, ban: (book.auto && book.auto.ban) || [], keys: { pexels: photoKey('pexels'), pixabay: photoKey('pixabay') } });
+    plan = await planAutoImages(book, { max: AUTO_MAX, interval: slideSec, people: autoPeopleOn(), ban: (book.auto && book.auto.ban) || [], keys: { pexels: photoKey('pexels'), pixabay: photoKey('pixabay') } });
   } catch (e) {
     book.auto = { ...(book.auto || {}), failAt: Date.now() };
     await db.putBook(book).catch(() => { });
@@ -486,7 +487,7 @@ async function collectAutoImages(book, manual) {
         if (!(await canDecode(blob))) throw new Error('decode');
         await db.putBlob(blobId, blob);
         await checkSaved(blobId, buf.byteLength);
-        pool.push({ blobId, term: x.term, file: x.file, t: x.t, src: x.src || 'wiki', key: x.key, caption: creditText(x.label || x.term, x.fileName ? credits.get(x.fileName) : x.credit, x.site), order: plan.indexOf(x) });
+        pool.push({ blobId, term: x.term, file: x.file, t: x.t, src: x.src || 'wiki', key: x.key, kind: x.kind, caption: creditText(x.label || x.term, x.fileName ? credits.get(x.fileName) : x.credit, x.site), order: plan.indexOf(x) });
       } catch { await db.deleteBlobs([blobId]).catch(() => { }); }
     }
   };
@@ -498,7 +499,8 @@ async function collectAutoImages(book, manual) {
   if (!still || hasImages(still)) { await db.deleteBlobs(pool.map(x => x.blobId)).catch(() => { }); return; }
   const old = (still.auto && still.auto.pool || []).map(x => x.blobId);
   const ban = (still.auto && still.auto.ban) || [];
-  still.auto = pool.length ? { pool, ban, at: Date.now() } : { none: true, ban, at: Date.now() };
+  const themes = (notes.themes || []).slice(0, 3);
+  still.auto = pool.length ? { pool, ban, themes, at: Date.now() } : { none: true, ban, at: Date.now() };
   await db.putBook(still);
   await db.deleteBlobs(old).catch(() => { });
   schedCache.delete(still.id);
@@ -506,7 +508,7 @@ async function collectAutoImages(book, manual) {
   renderLibrary();
   const badKey = ['pexels', 'pixabay'].filter(k => notes.bad && notes.bad[k]).map(k => k === 'pexels' ? 'Pexels' : 'Pixabay');
   if (badKey.length) toast(`${badKey.join('・')} の鍵が使えませんでした（設定で貼り直してください）。ほかの集め先の写真を集めました`, 7000);
-  else if (pool.length) toast(`「${still.title}」の写真を${pool.length}枚集めました（${srcSummary(pool)}）`, 5000);
+  else if (pool.length) toast(`「${still.title}」の写真を${pool.length}枚集めました（${srcSummary(pool)}）${themes.length ? `。テーマ：${themes.join('・')}` : ''}`, 6000);
   else if (manual) toast('この本に合う写真が見つかりませんでした', 5000);
 }
 
@@ -1763,6 +1765,13 @@ async function openSettings() {
     ag.onclick = () => { localStorage.setItem('kk.autoImg', autoImgOn() ? '0' : '1'); showAg(); };
     showAg();
     opts2.append(ag);
+    const pp = el('button', 'set-people');
+    const ppSub = el('span', 'sub', '');
+    const showPp = () => { const on = autoPeopleOn(); ppSub.textContent = on ? 'オン' : 'オフ'; pp.classList.toggle('sel', on); };
+    pp.append(el('span', null, '人物の写真も集める'), ppSub);
+    pp.onclick = () => { localStorage.setItem('kk.autoPeople', autoPeopleOn() ? '0' : '1'); showPp(); };
+    showPp();
+    opts2.append(pp);
     body.append(opts2);
     const secRow = el('div', 'bgm-vol slide-sec');
     secRow.append(el('span', null, '切り替え'));
@@ -1776,20 +1785,27 @@ async function openSettings() {
       secRow.append(sb);
     }
     body.append(secRow);
-    body.append(el('p', 'muted', '字幕の文章・章の名前・本の名前から言葉を拾い、その言葉の写真を、聞いている場所に合わせて出します（本を取り込んだとき・開いたときに、最大40枚を集めます）。集め先は、ウィキペディア（記事の写真）・ウィキメディア・コモンズ・Openverse（Flickr などの写真）と、鍵を貼ったときは Pexels・Pixabay です。人の名前では、似た別人の写真を避けるため、ウィキペディアの写真だけを使います。合わない写真は、写真を押して全画面にし「この写真を外す」で外せます。'));
+    body.append(el('p', 'muted', '本のあちこちに出てくる言葉から「この本のテーマ」（例：バレエ・ダンサー）を見つけて雰囲気の写真を集め、場所・建物・作品・行事などの名前が出てきたところでは、その写真を出します（本を取り込んだとき・開いたときに、最大40枚）。「ワークショップ」「花屋」のような一般的な言葉の写真は使いません。集め先は、ウィキペディア・ウィキメディア・コモンズ・Openverse（Flickr などの写真）と、鍵を貼ったときは Pixabay です。'));
+    body.append(el('p', 'muted', '人物の写真：オンにすると、実在の人の名前が出てきたところで、その人のウィキペディアの写真を出します（自伝・『私の履歴書』向け）。小説では作中の人物と関係のない写真になりやすいので、初めはオフです。変えたあと、前に集めた本は、本の「…」→「写真を集め直す」で入れ替わります。合わない写真は、写真を押して全画面にし「この写真を外す」で外せます。'));
     // 写真サイトの鍵（Pexels・Pixabay）
     body.append(el('h3', 'set-h', '写真サイトの鍵（無料・なくても使えます）'));
-    body.append(el('p', 'muted', 'Pexels・Pixabay は、雰囲気の合うきれいな写真が多いサイトです。それぞれのサイトでメールアドレスを登録すると「API キー」（鍵）がもらえます。下に貼ると、その写真も集めます。鍵はこの iPad の中にだけ保存します。貼ったあと、前に集めた本は、本の「…」→「写真を集め直す」で新しい写真が入ります。'));
-    for (const [kind, name, url] of [['pexels', 'Pexels', 'https://www.pexels.com/api/'], ['pixabay', 'Pixabay', 'https://pixabay.com/api/docs/']]) {
+    body.append(el('p', 'muted', 'Pixabay は、雰囲気の合うきれいな写真が多いサイトです。鍵（API キー）を貼ると、その写真も集めます。鍵はこの iPad の中にだけ保存します。'));
+    const steps = el('ol', 'key-steps muted');
+    for (const t of ['pixabay.com で「登録」（メールアドレスか Google アカウント）をして、ログインします。',
+      'ログインしたまま、下の「Pixabay の鍵をもらう」を押します（API の説明のページが開きます）。',
+      'ページを下へ進み、「Search Images」の下の「Parameters」の表の一番上、key の行に出る英数字の長い文字列が鍵です（ログインしていないと「Please login to see your API key here」と出ます）。',
+      'その文字列をコピーして下の欄に貼り、「保存」を押します。「使えます」と出れば完了です。前に集めた本は「写真を集め直す」で入れ替わります。']) steps.append(el('li', null, t));
+    body.append(steps);
+    for (const [kind, name, url] of [['pixabay', 'Pixabay', 'https://pixabay.com/api/docs/'], ['pexels', 'Pexels', 'https://www.pexels.com/api/']]) {
       const row = el('div', 'key-row key-' + kind);
       const lab = el('div', 'key-name');
-      const a = el('a', null, name + ' の鍵をもらう'); a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      const a = el('a', null, kind === 'pexels' ? 'Pexels の API のページ' : name + ' の鍵をもらう'); a.href = url; a.target = '_blank'; a.rel = 'noopener';
       lab.append(el('b', null, name), a);
       const inp = el('input', 'key-input'); inp.type = 'text'; inp.autocomplete = 'off'; inp.autocapitalize = 'off'; inp.spellcheck = false;
       inp.placeholder = '鍵を貼り付け'; inp.value = photoKey(kind);
       const save = el('button', 'pill key-save', '保存');
       const del = el('button', 'pill key-del', '消す');
-      const st = el('div', 'key-status muted', photoKey(kind) ? '保存しています' : 'まだありません');
+      const st = el('div', 'key-status muted', photoKey(kind) ? '保存しています' : (kind === 'pexels' ? 'Pexels は今、新しい鍵の発行を止めています。前にもらった鍵がある場合だけ使えます' : 'まだありません'));
       save.onclick = async () => {
         const v = inp.value.trim();
         if (!v) { st.textContent = '鍵を貼ってから「保存」を押してください'; return; }
