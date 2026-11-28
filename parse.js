@@ -154,6 +154,16 @@ function parseMeta(b, meta) {
   const ilst = child(b, metaBox, 'ilst');
   if (!ilst) return out;
   for (const item of boxes(b, ilst.body, ilst.end)) {
+    if (item.type === '----') {
+      try {
+        const kv = parseFreeform(b, item);
+        if (kv && kv.mean === 'com.apple.iTunes' && kv.name === 'YOMIAGE_EXPIRES') {
+          const d = normDate(kv.value);
+          if (d) out.expires = d;
+        }
+      } catch { /* 壊れたタグは無視 */ }
+      continue;
+    }
     const data = child(b, item, 'data');
     if (!data || data.body + 8 > data.end) continue;
     const kind = u32(b, data.body) & 0xffffff;
@@ -173,6 +183,28 @@ function parseMeta(b, meta) {
     }
   }
   return out;
+}
+
+// iTunes 形式の自由タグ（----）：mean・name は full box（頭4バイト）、data は頭8バイト（型・予約）の後が値
+function parseFreeform(b, item) {
+  let mean, name, value;
+  for (const c of boxes(b, item.body, item.end)) {
+    if (c.type === 'mean' && c.body + 4 <= c.end) mean = utf8.decode(b.subarray(c.body + 4, c.end)).trim();
+    else if (c.type === 'name' && c.body + 4 <= c.end) name = utf8.decode(b.subarray(c.body + 4, c.end)).trim();
+    else if (c.type === 'data' && c.body + 8 <= c.end && value === undefined) value = utf8.decode(b.subarray(c.body + 8, c.end));
+  }
+  if (mean === undefined || name === undefined || value === undefined) return null;
+  return { mean, name, value };
+}
+
+// "YYYY-MM-DD"（本当にある日付）だけを通す
+export function normDate(s) {
+  const m = /^\s*(\d{4})-(\d{2})-(\d{2})\s*$/.exec(String(s ?? '').replace(/\0/g, ''));
+  if (!m) return null;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
 // ---------------- MP3 ----------------

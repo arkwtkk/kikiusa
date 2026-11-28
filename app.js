@@ -1,9 +1,9 @@
 // app.js — ききウサ（iPad 用オーディオブックプレーヤー）
 import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta, parseSubtitles, cueAt,
-  isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt } from './parse.js';
+  isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt, normDate } from './parse.js';
 import * as db from './db.js';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -47,6 +47,25 @@ function size(bytes) {
   if (bytes >= 1e6) return Math.round(bytes / 1e6) + 'MB';
   return Math.max(1, Math.round(bytes / 1e3)) + 'KB';
 }
+
+// ---------------- 期限（自動で消す） ----------------
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function md(s) { const [, m, d] = s.split('-'); return `${+m}/${+d}`; }
+function addDays(s, n) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+const CHOKAN = /^日経 朝刊 (\d{4})年(\d{1,2})月(\d{1,2})日付$/;
+function paperDate(title) {
+  const m = CHOKAN.exec(String(title || '').trim());
+  return m ? normDate(`${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`) : null;
+}
+function shortTitle(t) { const m = CHOKAN.exec(String(t || '').trim()); return m ? `${+m[2]}/${+m[3]}付` : t; }
+function autoExpireOn() { return localStorage.getItem('kk.expire') !== '0'; }
 
 let toastTimer = 0;
 function toast(msg, ms = 3200) {
@@ -155,6 +174,7 @@ function renderLibrary() {
     more.setAttribute('aria-label', '本のメニュー');
     more.onclick = (e) => { e.stopPropagation(); bookMenu(b); };
     card.append(cov, el('div', 'card-title', b.title), el('div', 'card-meta', meta), bar, more);
+    if (b.expireAt && autoExpireOn()) card.insertBefore(el('div', 'card-exp', `${md(b.expireAt)} に消えます`), bar);
     card.onclick = () => openBook(b);
     grid.append(card);
   }
@@ -176,7 +196,8 @@ async function renderStorage() {
 function bookMenu(b) {
   openSheet(body => {
     body.append(el('h2', null, b.title));
-    const info = el('p', 'muted', `${b.chapters.length}章・${jaDur(b.duration)}・${size(b.files.reduce((s, f) => s + (f.size || 0), 0))}`);
+    const info = el('p', 'muted', `${b.chapters.length}章・${jaDur(b.duration)}・${size(b.files.reduce((s, f) => s + (f.size || 0), 0))}`
+      + (b.expireAt ? `・${md(b.expireAt)} に自動で消えます` : ''));
     const opts = el('div', 'opts');
     const add = (label, fn, cls) => { const x = el('button', cls, label); x.onclick = fn; opts.append(x); };
     add('名前を変える', () => renameBook(b));
@@ -211,6 +232,13 @@ function bookMenu(b) {
       renderLibrary();
       toast('写真を外しました');
     });
+    if (b.expireAt) add('自動で消さない', async () => {
+      closeSheet();
+      delete b.expireAt; b.noExpire = true;
+      await db.putBook(b);
+      renderLibrary();
+      toast('この本は自動では消しません');
+    });
     add('削除する', () => confirmDelete(b), 'danger');
     body.append(info, opts);
     actions(body, [['閉じる', 'cancel', closeSheet]]);
@@ -242,12 +270,68 @@ function confirmDelete(b) {
       ['やめる', 'cancel', closeSheet],
       ['削除する', 'go danger', async () => {
         closeSheet();
-        if (P.book && P.book.id === b.id) unloadBook();
-        await db.deleteBook(b);
-        try { localStorage.removeItem('kk.p.' + b.id); } catch { }
-        if (b.coverId && coverUrls.has(b.coverId)) { URL.revokeObjectURL(coverUrls.get(b.coverId)); coverUrls.delete(b.coverId); }
+        await removeBook(b);
         await refreshLibrary();
         toast('削除しました');
+      }],
+    ]);
+  });
+}
+
+// 本・音声・表紙・写真・字幕・位置を消す（削除と自動で消すの共通）
+async function removeBook(b) {
+  if (P.book && P.book.id === b.id) unloadBook();
+  await db.deleteBook(b);
+  try {
+    localStorage.removeItem('kk.p.' + b.id);
+    if (localStorage.getItem('kk.last') === b.id) localStorage.removeItem('kk.last');
+  } catch { }
+  if (b.coverId && coverUrls.has(b.coverId)) { URL.revokeObjectURL(coverUrls.get(b.coverId)); coverUrls.delete(b.coverId); }
+}
+
+// 期限の来た本を消す。今開いている本・再生中の本は消さない（ほかの本を開いたとき・次に起動したときに消える）
+let sweeping = false;
+async function sweepExpired({ notify = true } = {}) {
+  if (sweeping || !autoExpireOn()) return '';
+  sweeping = true;
+  try {
+    const today = todayStr();
+    const all = await db.allBooks().catch(() => books);
+    const due = all.filter(b => b.expireAt && b.expireAt <= today && !(P.book && P.book.id === b.id));
+    if (!due.length) return '';
+    const gone = [];
+    for (const b of due) {
+      try { await removeBook(b); gone.push(b); } catch { }
+    }
+    await refreshLibrary();
+    if (!gone.length) return '';
+    gone.sort((x, y) => x.expireAt < y.expireAt ? -1 : x.expireAt > y.expireAt ? 1 : 0);
+    const msg = `期限の来た本を${gone.length}冊消しました（${gone.map(b => shortTitle(b.title)).join('・')}）`;
+    if (notify) toast(msg, 6000);
+    return msg;
+  } finally { sweeping = false; }
+}
+
+// v0.3.1 までに取り込んだ朝刊の本（期限のタグなし）を、1回だけ聞いて期限を付ける
+function askLegacyOnce() {
+  if (localStorage.getItem('kk.expireAsked')) return;
+  localStorage.setItem('kk.expireAsked', '1');   // 聞くのは v0.4 を初めて開いたときの1回だけ
+  const list = books.filter(b => !b.expireAt && !b.noExpire && paperDate(b.title));
+  if (!list.length) return;
+  const today = todayStr();
+  const bytes = list.reduce((s, b) => s + b.files.reduce((t, f) => t + (f.size || 0), 0), 0);
+  const past = list.filter(b => addDays(paperDate(b.title), 14) <= today).length;
+  openSheet(body => {
+    body.append(el('h2', null, '朝刊の本を自動で消しますか？'));
+    body.append(el('p', null, `以前に取り込んだ朝刊の本が ${list.length}冊あります（合計 約 ${size(bytes)}）。新聞の日付から14日で自動で消すようにしますか？`
+      + (past ? `（うち ${past}冊はもう14日を過ぎているので、すぐ消えます）` : '')));
+    actions(body, [
+      ['しない', 'cancel', closeSheet],
+      ['そうする', 'go', async () => {
+        closeSheet();
+        for (const b of list) { b.expireAt = addDays(paperDate(b.title), 14); await db.putBook(b).catch(() => { }); }
+        renderLibrary();
+        if (!(await sweepExpired())) toast('朝刊の本は、新聞の日付から14日で自動で消えます');
       }],
     ]);
   });
@@ -436,7 +520,7 @@ async function planImport(files) {
   const plans = [];
   for (const f of audios.filter(f => extOf(f.name) === 'm4b')) {
     const m = metas.get(f);
-    plans.push({ files: [f], title: m.title || m.album || baseName(f.name), author: m.artist || '' });
+    plans.push({ files: [f], title: m.title || m.album || baseName(f.name), author: m.artist || '', expires: m.expires || null });
   }
   const rest = audios.filter(f => extOf(f.name) !== 'm4b').sort(byName);
   if (rest.length) {
@@ -460,6 +544,11 @@ async function planImport(files) {
     }
     p.dup = books.some(b => sameFiles(b, p.files));
     p.include = !p.dup;
+    if (p.expires) {
+      p.expired = p.expires <= todayStr();
+      p.autoExpire = !p.expired;
+      if (p.expired) p.include = false;
+    }
   }
   showImportSheet(plans, metas);
 }
@@ -469,7 +558,7 @@ function showImportSheet(plans, metas) {
     body.append(el('h2', null, plans.length > 1 ? `${plans.length}冊を取り込みます` : '本を取り込みます'));
     for (const p of plans) {
       const row = el('div', 'plan');
-      const cb = el('input'); cb.type = 'checkbox'; cb.checked = p.include;
+      const cb = el('input', 'inc-cb'); cb.type = 'checkbox'; cb.checked = p.include;
       cb.onchange = () => { p.include = cb.checked; };
       const main = el('div', 'plan-main');
       const name = el('input'); name.type = 'text'; name.value = p.title;
@@ -481,6 +570,17 @@ function showImportSheet(plans, metas) {
       if (p.subs.some(Boolean)) parts.push('字幕あり');
       if (p.pack && p.pack.items.length) parts.push(`写真${p.pack.items.length}枚`);
       main.append(name, el('div', 'plan-meta', parts.join('・')));
+      if (p.expires && !p.expired) {
+        const lab = el('label', 'plan-exp');
+        const ec = el('input', 'exp-cb'); ec.type = 'checkbox'; ec.checked = p.autoExpire;
+        const txt = el('span', null, '');
+        const show = () => { txt.textContent = ec.checked ? `${md(p.expires)} に自動で消します` : '自動で消す（今は消さない）'; };
+        ec.onchange = () => { p.autoExpire = ec.checked; show(); };
+        show();
+        lab.append(ec, txt);
+        main.append(lab);
+      }
+      if (p.expired) main.append(el('div', 'plan-warn', `期限（${md(p.expires)}）が${p.expires === todayStr() ? '来ています' : '過ぎています'}。取り込むときは自動では消しません`));
       if (p.dup) main.append(el('div', 'plan-warn', '同じ本がもう本棚にあります（取り込むと2冊になります）'));
       if (p.packError) main.append(el('div', 'plan-warn', `写真の包みを読めませんでした：${p.packError}`));
       row.append(cb, main);
@@ -573,6 +673,10 @@ async function doImport(plans, metas) {
         chapters: buildChapters(files, p.files.map(f => metas.get(f))),
         duration: files.reduce((s, f) => s + (f.duration || 0), 0),
       };
+      if (p.expires) {
+        if (p.autoExpire && !p.expired) book.expireAt = p.expires;
+        else book.noExpire = true;
+      }
       if (p.pack && p.pack.items.length) {
         showBusy(`取り込み中 ${pi + 1}/${plans.length}：${p.title}（写真）`, 1);
         const res = await saveImagePack(id, p.pack, saved);
@@ -592,9 +696,11 @@ async function doImport(plans, metas) {
   }
   hideBusy();
   await refreshLibrary();
+  const swept = await sweepExpired({ notify: !made });
   if (made) {
     const base = made > 1 ? `${made}冊を取り込みました` : '取り込みました';
-    toast(imgMsgs.length ? `${base}・${imgMsgs.join('・')}` : base, imgMsgs.length ? 7000 : 3200);
+    const msgs = [...imgMsgs]; if (swept) msgs.push(swept);
+    toast(msgs.length ? `${base}・${msgs.join('・')}` : base, msgs.length ? 7000 : 3200);
   }
 }
 
@@ -628,6 +734,7 @@ async function openBook(book) {
   if (pr && !book.finished) { fi = Math.min(Math.max(0, pr.f | 0), book.files.length - 1); t = pr.t || 0; }
   P.fi = fi; P.pendingSeek = t;
   renderPlayer();
+  sweepExpired();   // 前に開いていた本が期限切れなら、ここで消える
   await loadFile(fi, t, false);
 }
 
@@ -847,7 +954,7 @@ function onEnded() {
 window.addEventListener('pagehide', saveNow);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') saveNow();
-  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); }
+  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); sweepExpired(); }
 });
 
 // ---------------- ロック画面・コントロールセンター ----------------
@@ -1164,6 +1271,36 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowRight') skip(SKIP_FWD);
 });
 
+// ---------------- 設定 ----------------
+
+$('btnSettings').onclick = () => openSettings();
+async function openSettings() {
+  let usage = null, free = null;
+  try { const est = await navigator.storage?.estimate?.(); if (est) { usage = est.usage; if (est.quota) free = Math.max(0, est.quota - est.usage); } } catch { }
+  openSheet(body => {
+    body.append(el('h2', null, '設定'));
+    const opts = el('div', 'opts');
+    const tg = el('button', 'set-expire');
+    const lab = el('span', null, '期限の来た本を自動で消す');
+    const sub = el('span', 'sub', '');
+    const show = () => { const on = autoExpireOn(); sub.textContent = on ? 'オン' : 'オフ'; tg.classList.toggle('sel', on); };
+    tg.append(lab, sub);
+    tg.onclick = async () => {
+      localStorage.setItem('kk.expire', autoExpireOn() ? '0' : '1');
+      show(); renderLibrary();
+      if (autoExpireOn()) await sweepExpired();
+    };
+    show();
+    opts.append(tg);
+    body.append(opts);
+    body.append(el('p', 'muted', '期限の付いた本（日経よみあげが毎朝作る朝刊の本）を、期限の日にこの iPad から消します。開いている本は、ほかの本を開いたときか次に起動したときに消えます。'));
+    const n = books.filter(b => b.expireAt).length;
+    if (n) body.append(el('p', 'muted', `期限の付いた本：${n}冊`));
+    if (usage != null) body.append(el('p', 'set-usage', `ききウサが使っている容量 約 ${size(usage)}` + (free != null ? `（空きの目安 ${size(free)}）` : '')));
+    actions(body, [['閉じる', 'go', closeSheet]]);
+  });
+}
+
 // ---------------- はじめ ----------------
 
 function isStandalone() {
@@ -1174,12 +1311,17 @@ async function start() {
   const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   $('installHint').hidden = !(ios && !isStandalone());
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
+  let libraryOk = false;
   try {
     await refreshLibrary();
+    libraryOk = true;
   } catch (e) {
     $('empty').hidden = false;
     toast(`本棚を開けませんでした：${e && e.message || e}`, 8000);
   }
+  // 期限の来た本を消す（前回開いていた本も、ここなら消せる）
+  await sweepExpired().catch(() => { });
+  if (libraryOk) askLegacyOnce();
   // 前回聞いていた本をすぐ再開できるように用意だけしておく（自動では鳴らさない）
   const last = localStorage.getItem('kk.last');
   const b = books.find(x => x.id === last);
@@ -1195,6 +1337,6 @@ async function start() {
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, sweepExpired, todayStr, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
 
 start();
