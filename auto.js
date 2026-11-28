@@ -335,14 +335,6 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
     if (ext.has(term)) return ext.get(term);
     const info = lookup.get(term);
     const lists = [];
-    const tryList = async (name, fn) => {
-      try { lists.push(await fn()); }
-      catch (e) {
-        if ((name === 'pexels' || name === 'pixabay') && e && (e.status === 401 || e.status === 403 || e.status === 400)) notes.bad[name] = true;
-        if (name === 'openverse' && e && e.status === 429) ovLeft = 0;
-        notes.errors++;
-      }
-    };
     const person = isPerson(info);
     // 英語の名前があれば写真サイトは英語で探す（なければ日本語で）
     const q = info.moved ? term : (info.en || info.title);
@@ -358,7 +350,17 @@ export async function planAutoImages(book, { fetchFn = fetch, max = 40, perWin =
       if (!info.moved) jobs.push(['commons', () => commonsSearch(info.en || info.title, fetchFn)]);
       if (!info.moved && info.en && ovLeft > 0) { ovLeft--; jobs.push(['openverse', () => openverseSearch(info.en, fetchFn)]); }
     }
-    for (const [name, fn] of jobs) await tryList(name, fn);
+    // 集め先はそれぞれ別のサイトなので、同時に問い合わせる（混ぜる順は jobs の順のまま）
+    const results = await Promise.all(jobs.map(async ([name, fn]) => {
+      try { return await fn(); }
+      catch (e) {
+        if ((name === 'pexels' || name === 'pixabay') && e && (e.status === 401 || e.status === 403 || e.status === 400)) notes.bad[name] = true;
+        if (name === 'openverse' && e && e.status === 429) ovLeft = 0;
+        notes.errors++;
+        return [];
+      }
+    }));
+    for (const r of results) lists.push(r);
     // 集め先を順番に1枚ずつ混ぜる
     const merged = [];
     for (let k = 0; lists.some(l => l.length > k); k++) for (const l of lists) if (l[k]) merged.push(l[k]);
