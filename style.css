@@ -225,3 +225,20 @@ input[type=range]::-moz-range-progress { height: 5px; border-radius: 3px; backgr
 .foot { align-items: center; }
 .foot-btn { font-size: 13px; padding: 4px 8px; }
 .set-usage { margin-top: 10px; }
+
+/* v0.5 BGM */
+.set-h { font-size: 16px; margin: 18px 0 8px; }
+.bgm-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.bgm-row { display: flex; align-items: center; gap: 10px; background: var(--card); border-radius: 12px; padding: 8px 12px; }
+.bgm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 15px; padding: 4px 0; }
+.bgm-use { width: 20px; height: 20px; margin: 0; flex: none; }
+.bgm-row.off .bgm-name { color: var(--muted); }
+.bgm-row.now .bgm-name { color: var(--accent); font-weight: 700; }
+.bgm-mode { flex-wrap: wrap; }
+.bgm-mode .pill { min-width: 0; }
+.bgm-size { font-size: 12px; color: var(--muted); }
+.bgm-up, .bgm-del { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--bg); }
+.bgm-del { color: var(--danger); }
+.bgm-add { font-size: 15px; font-weight: 600; color: var(--accent); padding: 6px 0; }
+.bgm-vol { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
+.bgm-vol .pill { min-width: 64px; padding: 6px 14px; }

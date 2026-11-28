@@ -3,7 +3,7 @@ import { AUDIO_EXT, IMAGE_EXT, SUB_EXT, extOf, baseName, mimeOf, parseAudioMeta,
   isImagePack, imagePackBase, readZip, zipEntryBlob, parseImageManifest, imageAt, normDate } from './parse.js';
 import * as db from './db.js';
 
-const VERSION = '0.4';
+const VERSION = '0.5';
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 const RATES = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
@@ -809,6 +809,7 @@ function applyPendingSeek() {
 
 function doPlay() {
   if (!P.book) return;
+  bgmPrime();   // ▶ を押したとき（ユーザーの操作の中）に BGM の音の通り道を作る
   if (!audio.src) { toast('準備中です。もう一度押してください'); return; }
   if (P.book.finished) { P.book.finished = false; db.putBook(P.book); }
   if (P.pausedAt && Date.now() - P.pausedAt > 60000 && P.pendingSeek == null && audio.currentTime > 3) {
@@ -954,7 +955,7 @@ function onEnded() {
 window.addEventListener('pagehide', saveNow);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') saveNow();
-  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); sweepExpired(); }
+  else { renderPlayer(); if (!$('library').hidden) renderLibrary(); sweepExpired(); bgmSync(); }
 });
 
 // ---------------- ロック画面・コントロールセンター ----------------
@@ -1012,6 +1013,7 @@ function renderPlayer() {
   renderSleep();
   renderSubsButton();
   renderImgsButton();
+  renderBgmButton();
 }
 function fillCoverOnce(box, b) {
   if (box.dataset.book === b.id + '|' + b.title) return;
@@ -1132,6 +1134,226 @@ function renderSubsButton() {
   subShown = null;
   renderSubtitle();
 }
+// ---------------- BGM（自分で用意した曲を、本の声の後ろで小さく流す） ----------------
+// 本の声はいつもの audio 要素のまま。BGM は別の要素を Web Audio の GainNode に通して小さくする
+// （iPad の Safari では audio.volume を変えられないため）。ロック中に BGM だけ止まっても、本の声は続く。
+const BGM_VOL = { s: 0.07, m: 0.13, l: 0.22 };
+const BGM_VOL_LABEL = { s: '小', m: '中', l: '大' };
+const bgmAudio = new Audio();
+bgmAudio.preload = 'auto';
+let bgmList = loadBgmList();               // [{id, name, size, off?}]（off＝流さない曲）
+let bgmOn = localStorage.getItem('kk.bgm') !== '0';
+let bgmVol = BGM_VOL[localStorage.getItem('kk.bgmVol')] ? localStorage.getItem('kk.bgmVol') : 's';
+let bgmShuffle = localStorage.getItem('kk.bgmMode') === 'shuffle';
+let bgmCtx = null, bgmGain = null, bgmUrl = null, bgmLoadedId = null, bgmWanted = false, bgmStopTimer = 0;
+let bgmCur = (() => { try { return JSON.parse(localStorage.getItem('kk.bgmPos') || 'null')?.id || null; } catch { return null; } })();
+let bgmBag = [];   // シャッフルの残り（全部流し終わるまで同じ曲を繰り返さない）
+
+const bgmActive = () => bgmList.filter(x => !x.off);
+// 次に流す曲を決める
+function bgmPickNext(afterId) {
+  const act = bgmActive();
+  if (!act.length) return null;
+  if (bgmShuffle) {
+    bgmBag = bgmBag.filter(id => act.some(x => x.id === id) && id !== afterId);
+    if (!bgmBag.length) {
+      bgmBag = act.map(x => x.id).filter(id => act.length === 1 || id !== afterId);
+      for (let i = bgmBag.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [bgmBag[i], bgmBag[j]] = [bgmBag[j], bgmBag[i]]; }
+    }
+    return bgmBag.shift();
+  }
+  const i = bgmList.findIndex(x => x.id === afterId);
+  for (let k = 1; k <= bgmList.length; k++) {
+    const x = bgmList[(Math.max(i, -1) + k + bgmList.length) % bgmList.length];
+    if (!x.off) return x.id;
+  }
+  return null;
+}
+
+function loadBgmList() {
+  try { const a = JSON.parse(localStorage.getItem('kk.bgmList') || '[]'); return Array.isArray(a) ? a.filter(x => x && x.id) : []; } catch { return []; }
+}
+function saveBgmList() { localStorage.setItem('kk.bgmList', JSON.stringify(bgmList)); }
+function saveBgmPos() {
+  if (bgmLoadedId) try { localStorage.setItem('kk.bgmPos', JSON.stringify({ id: bgmLoadedId, t: bgmAudio.currentTime || 0 })); } catch { }
+}
+// 音の通り道（AudioContext → GainNode）。最初はユーザーの操作の中で作る必要がある
+function bgmPrime() {
+  if (!bgmActive().length) return;
+  if (bgmCtx) { if (bgmCtx.state !== 'running') bgmCtx.resume().catch(() => { }); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    bgmCtx = new AC();
+    bgmGain = bgmCtx.createGain();
+    bgmGain.gain.value = 0;
+    bgmCtx.createMediaElementSource(bgmAudio).connect(bgmGain);
+    bgmGain.connect(bgmCtx.destination);
+    if (bgmCtx.state !== 'running') bgmCtx.resume().catch(() => { });
+  } catch { bgmCtx = null; bgmGain = null; }
+}
+// 音量を変えられるか（Web Audio が使えない iPad では BGM を流さない＝大きな音で鳴らさない）
+function bgmCanQuiet() {
+  if (bgmGain) return true;
+  try { const v = bgmAudio.volume; bgmAudio.volume = 0.5; const ok = Math.abs(bgmAudio.volume - 0.5) < 0.01; bgmAudio.volume = v; return ok; } catch { return false; }
+}
+function bgmSetVolume(v, sec = 0) {
+  if (bgmGain && bgmCtx) {
+    const g = bgmGain.gain, now = bgmCtx.currentTime;
+    try { g.cancelScheduledValues(now); g.setValueAtTime(g.value, now); if (sec > 0) g.linearRampToValueAtTime(v, now + sec); else g.setValueAtTime(v, now); }
+    catch { g.value = v; }
+  } else {
+    try { bgmAudio.volume = v; } catch { }
+  }
+}
+async function bgmLoad() {
+  const act = bgmActive();
+  if (!act.length) return false;
+  if (!act.some(x => x.id === bgmCur)) bgmCur = bgmPickNext(bgmCur);
+  const item = bgmList.find(x => x.id === bgmCur);
+  if (!item) return false;
+  bgmAudio.loop = act.length === 1;
+  if (bgmLoadedId === item.id && bgmAudio.src) return true;
+  const b = await db.getBlob(item.id).catch(() => null);
+  if (!b || !b.size) return false;
+  if (bgmUrl) URL.revokeObjectURL(bgmUrl);
+  bgmUrl = URL.createObjectURL(b);
+  bgmAudio.src = bgmUrl;
+  bgmLoadedId = item.id;
+  const pos = (() => { try { return JSON.parse(localStorage.getItem('kk.bgmPos') || 'null'); } catch { return null; } })();
+  if (pos && pos.id === item.id && pos.t > 0) {
+    const t = pos.t;
+    bgmAudio.addEventListener('loadedmetadata', () => { try { if (t < (bgmAudio.duration || 0) - 1) bgmAudio.currentTime = t; } catch { } }, { once: true });
+  }
+  return true;
+}
+function bgmUnload() {
+  bgmAudio.pause();
+  bgmAudio.removeAttribute('src'); try { bgmAudio.load(); } catch { }
+  if (bgmUrl) URL.revokeObjectURL(bgmUrl);
+  bgmUrl = null; bgmLoadedId = null;
+}
+// 本の再生に合わせて BGM を鳴らす・止める（ファイルの切り替えで一瞬止まるのは待ってから止める）
+async function bgmSync() {
+  const want = !!(bgmOn && bgmActive().length && P.book && !audio.paused);
+  bgmWanted = want;
+  if (!want) {
+    if (bgmAudio.paused || bgmStopTimer) return;
+    bgmStopTimer = setTimeout(() => {
+      bgmStopTimer = 0;
+      if (!bgmWanted && !bgmAudio.paused) { bgmAudio.pause(); saveBgmPos(); }
+    }, 700);
+    return;
+  }
+  clearTimeout(bgmStopTimer); bgmStopTimer = 0;
+  if (bgmCtx && bgmCtx.state !== 'running') bgmCtx.resume().catch(() => { });
+  if (bgmPlaying()) { bgmSetVolume(BGM_VOL[bgmVol], 0.3); return; }
+  if (!bgmCanQuiet()) return;
+  if (!(await bgmLoad()) || !bgmWanted) return;
+  bgmSetVolume(0);
+  try { await bgmAudio.play(); } catch { return; }
+  if (!bgmWanted) { bgmAudio.pause(); return; }
+  bgmSetVolume(BGM_VOL[bgmVol], 2);   // 2秒かけて大きくする
+}
+// 鳴っているか（読めなかった曲は paused が false のまま残ることがあるので、error も見る）
+function bgmPlaying() { return !bgmAudio.paused && !!bgmLoadedId && !bgmAudio.error; }
+bgmAudio.addEventListener('ended', () => {
+  if (bgmAudio.loop) return;
+  bgmCur = bgmPickNext(bgmCur);
+  try { localStorage.removeItem('kk.bgmPos'); } catch { }
+  bgmSync();
+});
+// 曲を選んで、今すぐその曲に替える（鳴っていなければ次に鳴らすときにその曲から）
+function bgmPlayNow(id) {
+  if (!bgmList.some(x => x.id === id && !x.off)) return;
+  bgmCur = id;
+  try { localStorage.removeItem('kk.bgmPos'); } catch { }
+  const wasPlaying = bgmPlaying();
+  bgmUnload();
+  if (wasPlaying || bgmWanted) bgmSync();
+}
+function bgmSkip() { const n = bgmPickNext(bgmCur); if (n) bgmPlayNow(n); }
+bgmAudio.addEventListener('error', () => {
+  if (!bgmLoadedId) return;
+  // 読めない曲は飛ばす（1回だけ知らせる）
+  const bad = bgmList.find(x => x.id === bgmLoadedId);
+  bgmLoadedId = null;
+  try { bgmAudio.pause(); } catch { }
+  if (bgmActive().length > 1) { bgmCur = bgmPickNext(bad && bad.id); bgmAudio.removeAttribute('src'); setTimeout(bgmSync, 300); }
+  if (bad) toast(`BGM「${bad.name}」を再生できませんでした`);
+});
+setInterval(() => { if (!bgmAudio.paused) saveBgmPos(); }, 10000);
+
+function renderBgmButton() {
+  const b = $('btnBgm');
+  b.hidden = !bgmActive().length;
+  b.classList.toggle('on', bgmOn);
+  b.textContent = bgmOn ? 'BGM あり' : 'BGM なし';
+}
+$('btnBgm').onclick = () => {
+  bgmOn = !bgmOn;
+  localStorage.setItem('kk.bgm', bgmOn ? '1' : '0');
+  if (bgmOn) bgmPrime();
+  renderBgmButton();
+  bgmSync();
+};
+
+// 曲を足す（中身を最後まで読んでから保存し、読み戻して確かめる）
+$('bgmInput').onchange = async (e) => {
+  const files = [...e.target.files].filter(f => AUDIO_EXT.includes(extOf(f.name)));
+  e.target.value = '';
+  if (!files.length) { toast('音声ファイル（.mp3 .m4a など）を選んでください'); return; }
+  showBusy('BGM の曲を保存しています…');
+  let added = 0;
+  const errs = [];
+  for (const [i, f] of files.entries()) {
+    const id = `bgm.${Date.now().toString(36)}${i}`;
+    try {
+      const buf = await f.arrayBuffer();
+      if (!buf.byteLength) throw new Error('中身が空です');
+      await db.putBlob(id, new Blob([buf], { type: mimeOf(f.name) }));
+      await checkSaved(id, buf.byteLength);
+      bgmList.push({ id, name: baseName(f.name), size: buf.byteLength });
+      added++;
+    } catch (err) {
+      await db.deleteBlobs([id]).catch(() => { });
+      errs.push(db.isQuotaError(err) ? 'iPad の空き容量が足りません' : (err && err.message || String(err)));
+    }
+  }
+  saveBgmList();
+  hideBusy();
+  renderBgmButton();
+  openSettings();
+  toast(added ? `BGM の曲を${added}曲追加しました` + (errs.length ? `（${errs.length}曲は保存できませんでした：${errs[0]}）` : '') : `保存できませんでした：${errs[0]}`, 6000);
+  bgmSync();
+};
+async function removeBgm(id) {
+  if (bgmLoadedId === id) { bgmUnload(); }
+  const i = bgmList.findIndex(x => x.id === id);
+  if (i < 0) return;
+  bgmList.splice(i, 1);
+  if (bgmCur === id) bgmCur = null;
+  saveBgmList();
+  await db.deleteBlobs([id]).catch(() => { });
+  try { const pos = JSON.parse(localStorage.getItem('kk.bgmPos') || 'null'); if (pos && pos.id === id) localStorage.removeItem('kk.bgmPos'); } catch { }
+  renderBgmButton();
+  bgmSync();
+}
+function bgmToggleUse(id) {
+  const x = bgmList.find(y => y.id === id);
+  if (!x) return;
+  if (x.off) delete x.off; else x.off = true;
+  saveBgmList();
+  if (x.off && bgmLoadedId === id) { bgmCur = bgmPickNext(id); bgmUnload(); }
+  renderBgmButton();
+  bgmSync();
+}
+function bgmMoveUp(i) {
+  if (i <= 0 || i >= bgmList.length) return;
+  [bgmList[i - 1], bgmList[i]] = [bgmList[i], bgmList[i - 1]];
+  saveBgmList();
+}
+
 $('btnSubs').onclick = () => {
   subsOn = !subsOn;
   localStorage.setItem('kk.subs', subsOn ? '1' : '0');
@@ -1271,6 +1493,9 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowRight') skip(SKIP_FWD);
 });
 
+// 本の声は「再生」の扱いにする（BGM の Web Audio があっても、ロック中に本が止まらないように）
+try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { }
+
 // ---------------- 設定 ----------------
 
 $('btnSettings').onclick = () => openSettings();
@@ -1296,6 +1521,66 @@ async function openSettings() {
     body.append(el('p', 'muted', '期限の付いた本（日経よみあげが毎朝作る朝刊の本）を、期限の日にこの iPad から消します。開いている本は、ほかの本を開いたときか次に起動したときに消えます。'));
     const n = books.filter(b => b.expireAt).length;
     if (n) body.append(el('p', 'muted', `期限の付いた本：${n}冊`));
+
+    // BGM
+    body.append(el('h3', 'set-h', 'BGM（本の声の後ろで小さく流す曲）'));
+    if (bgmList.length) {
+      const ul = el('div', 'bgm-list');
+      bgmList.forEach((x, i) => {
+        const row = el('div', 'bgm-row' + (x.off ? ' off' : '') + (x.id === bgmLoadedId && bgmPlaying() ? ' now' : ''));
+        const use = el('input', 'bgm-use'); use.type = 'checkbox'; use.checked = !x.off;
+        use.setAttribute('aria-label', '流す');
+        use.onchange = () => { bgmToggleUse(x.id); openSettings(); };
+        const name = el('button', 'bgm-name', (x.id === bgmLoadedId && bgmPlaying() ? '♪ ' : '') + x.name);
+        name.onclick = () => {
+          if (x.off) { toast('チェックを付けると流せます'); return; }
+          bgmPlayNow(x.id); openSettings();
+          toast(bgmWanted ? `「${x.name}」に替えました` : `次は「${x.name}」から流します`);
+        };
+        row.append(use, name, el('span', 'bgm-size', size(x.size || 0)));
+        if (i > 0) { const up = el('button', 'bgm-up', '↑'); up.setAttribute('aria-label', '上へ'); up.onclick = () => { bgmMoveUp(i); openSettings(); }; row.append(up); }
+        const del = el('button', 'bgm-del', '削除');
+        del.onclick = async () => { await removeBgm(x.id); openSettings(); toast(`「${x.name}」を外しました`); };
+        row.append(del);
+        ul.append(row);
+      });
+      body.append(ul);
+      const modeRow = el('div', 'bgm-vol bgm-mode');
+      modeRow.append(el('span', null, '流し方'));
+      for (const [k, label] of [['order', '順番'], ['shuffle', 'シャッフル']]) {
+        const mb = el('button', 'pill bgm-mode-' + k + ((k === 'shuffle') === bgmShuffle ? ' on' : ''), label);
+        mb.onclick = () => {
+          bgmShuffle = k === 'shuffle'; bgmBag = [];
+          localStorage.setItem('kk.bgmMode', k);
+          modeRow.querySelectorAll('.pill').forEach(b => b.classList.toggle('on', b === mb));
+        };
+        modeRow.append(mb);
+      }
+      if (bgmActive().length > 1) {
+        const sk = el('button', 'pill bgm-skip', '次の曲 ▶▶');
+        sk.onclick = () => { bgmSkip(); openSettings(); };
+        modeRow.append(sk);
+      }
+      body.append(modeRow);
+    } else {
+      body.append(el('p', 'muted', 'まだ曲がありません。「曲を追加」で、ファイル アプリから MP3・M4A などを選んでください（Apple Music の曲は使えません）。'));
+    }
+    const addBtn = el('button', 'bgm-add', '＋ 曲を追加');
+    addBtn.onclick = () => { const i = $('bgmInput'); i.value = ''; i.click(); };
+    body.append(addBtn);
+    const volRow = el('div', 'bgm-vol');
+    volRow.append(el('span', null, '音量'));
+    for (const k of ['s', 'm', 'l']) {
+      const vb = el('button', 'pill bgm-vol-' + k + (bgmVol === k ? ' on' : ''), BGM_VOL_LABEL[k]);
+      vb.onclick = () => {
+        bgmVol = k; localStorage.setItem('kk.bgmVol', k);
+        volRow.querySelectorAll('.pill').forEach(b => b.classList.toggle('on', b === vb));
+        if (!bgmAudio.paused) bgmSetVolume(BGM_VOL[k], 0.4);
+      };
+      volRow.append(vb);
+    }
+    body.append(volRow);
+    body.append(el('p', 'muted', 'チェックを付けた曲を、順番かシャッフルで繰り返し流します。曲名を押すとその曲に替わります。本を止めると BGM も止まります。再生画面の［BGM］で、あり・なしを切り替えられます。画面をロックしている間は BGM が止まることがあります（本の声は続きます）。'));
     if (usage != null) body.append(el('p', 'set-usage', `ききウサが使っている容量 約 ${size(usage)}` + (free != null ? `（空きの目安 ${size(free)}）` : '')));
     actions(body, [['閉じる', 'go', closeSheet]]);
   });
@@ -1335,8 +1620,10 @@ async function start() {
   }
 }
 audio.addEventListener('play', () => { if (P.book) localStorage.setItem('kk.last', P.book.id); });
+audio.addEventListener('playing', () => bgmSync());
+audio.addEventListener('pause', () => bgmSync());
 
 // テスト用（画面の外からの確認）
-window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, sweepExpired, todayStr, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
+window.__kk = { P, audio, get books() { return books; }, refreshLibrary, planImport, openBook, seekBook, skip, gotoChapter, nextChapter, prevChapter, getProg, get sleep() { return sleep; }, get subText() { return $('subtitle').hidden ? '' : $('subtitle').textContent; }, sweepExpired, todayStr, bgmAudio, get bgm() { return { list: bgmList, on: bgmOn, vol: bgmVol, cur: bgmCur, shuffle: bgmShuffle, loadedId: bgmLoadedId, gain: bgmGain ? bgmGain.gain.value : null, ctx: bgmCtx ? bgmCtx.state : null }; }, get slide() { return $('slide').hidden ? null : { id: slideShown, cap: $('slideCap').hidden ? '' : $('slideCap').textContent }; }, badImages };
 
 start();
